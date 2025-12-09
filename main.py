@@ -20,6 +20,7 @@ from pyrogram import Client
 from pyrogram.errors import BadRequest, FloodWait, RPCError, UsernameNotOccupied
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
+from telegram.error import NetworkError
 from telegram.ext import (
     AIORateLimiter,
     Application,
@@ -1094,6 +1095,9 @@ def main() -> None:
     logging.info("Bot started and polling.")
     try:
         app.run_polling()
+    except NetworkError as exc:
+        logging.error("Failed to connect to Telegram: %s", exc)
+        raise SystemExit(1) from exc
     finally:
         asyncio.run(data_store.close())
 

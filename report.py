@@ -12,14 +12,48 @@ from typing import Iterable, Sequence
 
 from pyrogram import Client
 from pyrogram.errors import BadRequest, FloodWait, MessageIdInvalid, RPCError
+from pyrogram.raw.types import (
+    InputReportReasonChildAbuse,
+    InputReportReasonCopyright,
+    InputReportReasonOther,
+    InputReportReasonPornography,
+    InputReportReasonSpam,
+    InputReportReasonViolence,
+)
 
 
-async def send_report(client: Client, chat_id, message_id: int, reason: int, reason_text: str) -> bool:
+def _build_reason(reason: int | object, message: str) -> object:
+    """Return a Pyrogram InputReportReason object for the given code or instance."""
+
+    reason_map = {
+        0: InputReportReasonSpam,
+        1: InputReportReasonViolence,
+        2: InputReportReasonPornography,
+        3: InputReportReasonChildAbuse,
+        4: InputReportReasonCopyright,
+        5: InputReportReasonOther,
+    }
+
+    if hasattr(reason, "write"):
+        return reason
+
+    try:
+        reason_int = int(reason)
+    except Exception:
+        return InputReportReasonOther(text=message[:512] if message else "")
+
+    reason_cls = reason_map.get(reason_int, InputReportReasonOther)
+    if reason_cls is InputReportReasonOther:
+        return reason_cls(text=message[:512] if message else "")
+
+    return reason_cls()
+
+
+async def send_report(client: Client, chat_id, message_id: int, reason: int | object, reason_text: str) -> bool:
     """Send a report against a specific message."""
     try:
-        await client.send_report(
-            chat_id=chat_id, message_id=message_id, reason=int(reason), message=reason_text
-        )
+        reason_obj = _build_reason(reason, reason_text)
+        await client.send_report(chat_id=chat_id, message_id=message_id, reason=reason_obj, message=reason_text)
         return True
 
     except MessageIdInvalid:
@@ -34,11 +68,12 @@ async def send_report(client: Client, chat_id, message_id: int, reason: int, rea
         return False
 
 
-async def report_profile_photo(client: Client, entity_id, reason: int, reason_text: str) -> bool:
+async def report_profile_photo(client: Client, entity_id, reason: int | object, reason_text: str) -> bool:
     """Report a user profile, chat, or generic entity."""
 
     try:
-        await client.send_report(chat_id=entity_id, message_id=None, reason=int(reason), message=reason_text)
+        reason_obj = _build_reason(reason, reason_text)
+        await client.send_report(chat_id=entity_id, message_id=None, reason=reason_obj, message=reason_text)
         return True
 
     except (FloodWait, BadRequest, RPCError):
@@ -117,32 +152,15 @@ async def bulk_report_messages(
 if not hasattr(Client, "send_report"):
     # Lazy imports so users without reporting needs avoid pulling raw types prematurely.
     from pyrogram.raw.functions.messages import Report
-    from pyrogram.raw.types import (
-        InputReportReasonChildAbuse,
-        InputReportReasonCopyright,
-        InputReportReasonOther,
-        InputReportReasonPornography,
-        InputReportReasonSpam,
-        InputReportReasonViolence,
-    )
 
     async def _client_send_report(
         self,
         chat_id,
         message_id: int | None = None,
-        reason: int = 0,
+        reason: int | object = 0,
         message: str = "",
     ) -> None:
         """High-level wrapper for the raw ``messages.Report`` call."""
-
-        reason_map = {
-            0: InputReportReasonSpam,
-            1: InputReportReasonViolence,
-            2: InputReportReasonPornography,
-            3: InputReportReasonChildAbuse,
-            4: InputReportReasonCopyright,
-            5: InputReportReasonOther,
-        }
 
         try:
             peer = None
@@ -155,11 +173,7 @@ if not hasattr(Client, "send_report"):
             else:
                 peer = chat_id
 
-            reason_cls = reason_map.get(int(reason), InputReportReasonOther)
-            if reason_cls is InputReportReasonOther:
-                reason_obj = reason_cls(text=message[:512] if message else "")
-            else:
-                reason_obj = reason_cls()
+            reason_obj = _build_reason(reason, message)
 
             ids = [int(message_id)] if message_id is not None else []
 

@@ -477,21 +477,34 @@ async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE
         return ConversationHandler.END
 
     await query.edit_message_text("Reporting has started. I'll send updates when done.")
-    asyncio.create_task(run_report_job(query, context))
+
+    # Capture a snapshot of the current conversation data so that subsequent
+    # /report runs do not erase the information needed by this background task.
+    job_data = {
+        "targets": list(context.user_data.get("targets", [])),
+        "reasons": list(context.user_data.get("reasons", [])),
+        "count": context.user_data.get("count", DEFAULT_REPORTS),
+        "sessions": list(context.user_data.get("sessions", [])),
+        "api_id": context.user_data.get("api_id"),
+        "api_hash": context.user_data.get("api_hash"),
+        "reason_code": context.user_data.get("reason_code", 5),
+    }
+
+    asyncio.create_task(run_report_job(query, context, job_data))
     return ConversationHandler.END
 
 
-async def run_report_job(query, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def run_report_job(query, context: ContextTypes.DEFAULT_TYPE, job_data: dict) -> None:
     user = query.from_user
     chat_id = query.message.chat_id
 
-    targets = context.user_data.get("targets", [])
-    reasons = context.user_data.get("reasons", [])
-    count = context.user_data.get("count", DEFAULT_REPORTS)
-    sessions = context.user_data.get("sessions", [])
-    api_id = context.user_data.get("api_id")
-    api_hash = context.user_data.get("api_hash")
-    reason_code = context.user_data.get("reason_code", 5)
+    targets = job_data.get("targets", [])
+    reasons = job_data.get("reasons", [])
+    count = job_data.get("count", DEFAULT_REPORTS)
+    sessions = job_data.get("sessions", [])
+    api_id = job_data.get("api_id")
+    api_hash = job_data.get("api_hash")
+    reason_code = job_data.get("reason_code", 5)
 
     started = datetime.now(timezone.utc)
     await context.bot.send_message(chat_id=chat_id, text="Preparing clients...")
@@ -550,7 +563,9 @@ async def perform_reporting(
     api_id: int | None,
     api_hash: str | None,
     reason_code: int = 5,
+    max_concurrency: int = 25,
 ) -> dict:
+    """Send repeated report requests with bounded concurrency."""
     if not (api_id and api_hash):
         ensure_pyrogram_creds()
         api_id = config.API_ID
@@ -597,17 +612,27 @@ async def perform_reporting(
                 halted = True
                 return False
 
-        tasks = []
-        for i in range(total):
-            client = clients[i % len(clients)]
-            tasks.append(asyncio.create_task(report_once(client)))
+        # Avoid spawning thousands of concurrent tasks by capping worker count.
+        worker_count = max(1, min(max_concurrency, total, len(clients)))
+        queue: asyncio.Queue[Client] = asyncio.Queue()
 
-        if tasks:
-            for result in await asyncio.gather(*tasks):
+        for _ in range(total):
+            queue.put_nowait(clients[_ % len(clients)])
+
+        async def worker() -> None:
+            nonlocal success, failed
+            while not queue.empty():
+                client = await queue.get()
+                result = await report_once(client)
                 if result:
                     success += 1
                 else:
                     failed += 1
+                queue.task_done()
+
+        workers = [asyncio.create_task(worker()) for _ in range(worker_count)]
+        await queue.join()
+        await asyncio.gather(*workers)
 
         return {"success": success, "failed": failed, "halted": halted}
 

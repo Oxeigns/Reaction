@@ -599,7 +599,7 @@ def build_app() -> Application:
     return application
 
 
-async def main() -> None:
+def main() -> None:
     build_logger()
     app = build_app()
 
@@ -607,12 +607,14 @@ async def main() -> None:
     # logic. Running it directly avoids calling the deprecated Updater APIs that
     # no longer provide an `idle` helper in PTB 21+.
     logging.info("Bot started and polling.")
-    await app.run_polling()
-    await data_store.close()
+    try:
+        app.run_polling()
+    finally:
+        asyncio.run(data_store.close())
 
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        main()
     except KeyboardInterrupt:
         logging.info("Bot stopped by user.")

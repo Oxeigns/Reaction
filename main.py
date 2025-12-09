@@ -734,7 +734,9 @@ async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE
     # /report runs do not erase the information needed by this background task.
     job_data = deepcopy(flow_state(context))
 
-    asyncio.create_task(run_report_job(query, context, job_data))
+    # Use the application's task helper so the job is cancelled cleanly when the
+    # bot shuts down. This avoids stray "Event loop is closed" errors.
+    context.application.create_task(run_report_job(query, context, job_data))
     return ConversationHandler.END
 
 
@@ -754,55 +756,59 @@ async def run_report_job(query, context: ContextTypes.DEFAULT_TYPE, job_data: di
 
     messages = []
 
-    for target in targets:
-        started = datetime.now(timezone.utc)
-        try:
-            summary = await perform_reporting(
-                target,
-                reasons,
-                count,
-                sessions,
-                api_id=api_id,
-                api_hash=api_hash,
-                reason_code=reason_code,
-                invite_link=job_data.get("invite_link"),
+    try:
+        for target in targets:
+            started = datetime.now(timezone.utc)
+            try:
+                summary = await perform_reporting(
+                    target,
+                    reasons,
+                    count,
+                    sessions,
+                    api_id=api_id,
+                    api_hash=api_hash,
+                    reason_code=reason_code,
+                    invite_link=job_data.get("invite_link"),
+                )
+            except Exception as exc:  # pragma: no cover - runtime safety
+                logging.exception("Failed to complete reporting job")
+                summary = {"success": 0, "failed": 0, "halted": True, "error": str(exc)}
+
+            ended = datetime.now(timezone.utc)
+            sessions_used = summary.get("sessions_started", len(sessions))
+            text = (
+                f"Target: {target}\n"
+                f"Reasons: {', '.join(reasons)}\n"
+                f"Requested: {count}\n"
+                f"Sessions used: {sessions_used}\n"
+                f"Success: {summary['success']} | Failed: {summary['failed']}\n"
+                f"Stopped early: {'Yes' if summary.get('halted') else 'No'}\n"
+                f"Error: {summary.get('error', 'None')}\n"
+                f"Started: {started.isoformat()}\n"
+                f"Ended: {ended.isoformat()}"
             )
-        except Exception as exc:  # pragma: no cover - runtime safety
-            logging.exception("Failed to complete reporting job")
-            summary = {"success": 0, "failed": 0, "halted": True, "error": str(exc)}
+            messages.append(text)
 
-        ended = datetime.now(timezone.utc)
-        sessions_used = summary.get("sessions_started", len(sessions))
-        text = (
-            f"Target: {target}\n"
-            f"Reasons: {', '.join(reasons)}\n"
-            f"Requested: {count}\n"
-            f"Sessions used: {sessions_used}\n"
-            f"Success: {summary['success']} | Failed: {summary['failed']}\n"
-            f"Stopped early: {'Yes' if summary.get('halted') else 'No'}\n"
-            f"Error: {summary.get('error', 'None')}\n"
-            f"Started: {started.isoformat()}\n"
-            f"Ended: {ended.isoformat()}"
-        )
-        messages.append(text)
+            await data_store.record_report(
+                {
+                    "user_id": user.id if user else None,
+                    "target": target,
+                    "reasons": reasons,
+                    "requested": count,
+                    "sessions": sessions_used,
+                    "success": summary["success"],
+                    "failed": summary["failed"],
+                    "started_at": started,
+                    "ended_at": ended,
+                    "halted": summary.get("halted", False),
+                }
+            )
 
-        await data_store.record_report(
-            {
-                "user_id": user.id if user else None,
-                "target": target,
-                "reasons": reasons,
-                "requested": count,
-                "sessions": sessions_used,
-                "success": summary["success"],
-                "failed": summary["failed"],
-                "started_at": started,
-                "ended_at": ended,
-                "halted": summary.get("halted", False),
-            }
-        )
-
-        if summary.get("halted"):
-            break
+            if summary.get("halted"):
+                break
+    except asyncio.CancelledError:  # pragma: no cover - application shutdown
+        logging.info("Report job cancelled during shutdown")
+        return
 
     await context.bot.send_message(chat_id=chat_id, text="\n\n".join(messages))
 

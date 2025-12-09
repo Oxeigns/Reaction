@@ -9,6 +9,8 @@ structured so the caller can centralize concurrency and retry logic.
 from __future__ import annotations
 
 import asyncio
+from typing import Iterable, Sequence
+
 from pyrogram import Client
 from pyrogram.errors import BadRequest, FloodWait, MessageIdInvalid, RPCError
 
@@ -54,6 +56,79 @@ async def report_profile_photo(client: Client, entity_id, reason: int, reason_te
     except Exception as exc:  # pragma: no cover - defensive logging
         print(f"Profile/Chat Report API Error (Session {getattr(client, 'name', 'unknown')}): {exc}")
         return False
+
+
+async def bulk_report_messages(
+    clients: Sequence[Client],
+    chat_id,
+    message_ids: Iterable[int],
+    reason: int,
+    reason_text: str,
+    *,
+    concurrency: int = 5,
+    retry_on_flood: bool = True,
+) -> dict[str, int]:
+    """Report multiple messages using multiple client sessions.
+
+    The helper fans out :func:`send_report` requests across the provided
+    ``clients`` with a concurrency limit. When a :class:`FloodWait` is raised,
+    the function optionally retries the request after sleeping for the advised
+    duration. Each task returns one of ``success`` or ``failed`` and the final
+    summary contains counts for both outcomes.
+    """
+
+    semaphore = asyncio.Semaphore(max(concurrency, 1))
+
+    async def _report_single(client: Client, message_id: int) -> str:
+        async with semaphore:
+            try:
+                ok = await send_report(client, chat_id, message_id, reason, reason_text)
+                return "success" if ok else "failed"
+            except FloodWait as fw:
+                if not retry_on_flood:
+                    print(
+                        f"[{getattr(client, 'name', 'unknown')}] Flood wait {fw.value}s for message {message_id}. Skipping."
+                    )
+                    return "failed"
+
+                sleep_for = getattr(fw, "value", 1)
+                print(
+                    f"[{getattr(client, 'name', 'unknown')}] Flood wait {sleep_for}s for message {message_id}. Retrying once."
+                )
+                await asyncio.sleep(sleep_for)
+
+                try:
+                    ok = await send_report(client, chat_id, message_id, reason, reason_text)
+                    return "success" if ok else "failed"
+                except Exception as exc:  # pragma: no cover - defensive logging
+                    print(
+                        f"[{getattr(client, 'name', 'unknown')}] Retry failed for message {message_id}: {exc}"
+                    )
+                    return "failed"
+
+            except BadRequest as exc:
+                print(
+                    f"[{getattr(client, 'name', 'unknown')}] Bad request while reporting {message_id}: {exc}"
+                )
+                return "failed"
+            except RPCError as exc:
+                print(f"[{getattr(client, 'name', 'unknown')}] RPC error for {message_id}: {exc}")
+                return "failed"
+
+    tasks = [
+        asyncio.create_task(_report_single(client, int(message_id)))
+        for client in clients
+        for message_id in message_ids
+    ]
+
+    summary = {"success": 0, "failed": 0}
+    if not tasks:
+        return summary
+
+    for result in await asyncio.gather(*tasks):
+        summary[result] += 1
+
+    return summary
 
 
 if not hasattr(Client, "send_report"):

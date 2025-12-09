@@ -602,13 +602,12 @@ def build_app() -> Application:
 async def main() -> None:
     build_logger()
     app = build_app()
-    await app.initialize()
-    await app.start()
+
+    # Application.run_polling takes care of initialization, startup, and shutdown
+    # logic. Running it directly avoids calling the deprecated Updater APIs that
+    # no longer provide an `idle` helper in PTB 21+.
     logging.info("Bot started and polling.")
-    await app.updater.start_polling()
-    await app.updater.idle()
-    await app.stop()
-    await app.shutdown()
+    await app.run_polling()
     await data_store.close()
 
 

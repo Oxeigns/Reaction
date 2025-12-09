@@ -1,26 +1,15 @@
 #!/usr/bin/env python3
-"""Telegram "report helper" bot (educational demo).
-
-Run instructions
-----------------
-1) Install dependencies: ``python -m pip install -r requirements.txt``.
-2) Export environment variables (or edit ``config.py``):
-   - ``BOT_TOKEN``: Telegram bot token from @BotFather.
-   - ``LOG_CHAT_ID``: Chat ID that should receive audit logs.
-   - ``ADMIN_USER_IDS`` (optional): Comma-separated user IDs allowed to use /admin.
-3) Start the bot: ``python main.py``.
-
-The bot is intentionally educational. It simulates sensitive prompts (passwords,
-login codes, session strings) and reporting flows. Remind users not to share
-real secrets and to report only genuine abuse.
-"""
+"""Telegram reporting bot that coordinates multiple Pyrogram sessions."""
 from __future__ import annotations
 
 import asyncio
 import logging
 from datetime import datetime, timezone
-from typing import Dict
+from typing import Iterable, List
+from urllib.parse import urlparse
 
+from pyrogram import Client
+from pyrogram.errors import BadRequest, FloodWait, RPCError
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -36,18 +25,22 @@ from telegram.ext import (
 )
 
 import config
+from report import report_profile_photo
+from storage import DataStore
 
 # Conversation states
-SELECT_TYPE, ASK_TARGET, ASK_REASON, ASK_EVIDENCE, ASK_PASSWORD, ASK_CODE, ASK_SESSION = range(7)
+REPORT_URL, REPORT_REASONS, REPORT_COUNT, REPORT_SESSIONS = range(4)
+ADD_SESSIONS = 10
+
+DEFAULT_REPORTS = 5000
+MIN_SESSIONS = 5
+MAX_SESSIONS = 500
+
+data_store = DataStore(config.MONGO_URI)
 
 
 def build_logger() -> None:
-    """Configure application logging to stdout."""
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
 
 def ensure_token() -> str:
@@ -56,26 +49,49 @@ def ensure_token() -> str:
     return config.BOT_TOKEN
 
 
+def ensure_pyrogram_creds() -> None:
+    if not (config.API_ID and config.API_HASH):
+        raise RuntimeError("API_ID and API_HASH are required for Pyrogram sessions")
+
+
 def main_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("Report a user", callback_data="type:user")],
-            [InlineKeyboardButton("Report a group", callback_data="type:group")],
-            [InlineKeyboardButton("Report a channel", callback_data="type:channel")],
-            [InlineKeyboardButton("Report a story", callback_data="type:story")],
+            [InlineKeyboardButton("Start report", callback_data="action:start")],
+            [InlineKeyboardButton("Add sessions", callback_data="action:add")],
         ]
     )
 
 
-def admin_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("View safety notice", callback_data="admin:notice")]]
-    )
+def friendly_error(message: str) -> str:
+    return f"⚠️ {message}\nUse the menu below or try again."
+
+
+def parse_reasons(text: str) -> List[str]:
+    reasons = [line.strip() for line in text.replace(";", "\n").splitlines() if line.strip()]
+    return reasons[:5]
+
+
+def is_valid_link(text: str) -> bool:
+    text = text.strip()
+    return text.startswith("https://t.me/") or text.startswith("t.me/") or text.startswith("@")
+
+
+def extract_target_identifier(text: str) -> str:
+    text = text.strip()
+    if text.startswith("@"):  # username
+        return text[1:]
+
+    parsed = urlparse(text if text.startswith("http") else f"https://{text}")
+    path = parsed.path.lstrip("/")
+    return path.split("/", maxsplit=1)[0]
+
+
+def session_strings_from_text(text: str) -> list[str]:
+    return [line.strip() for line in text.splitlines() if line.strip()]
 
 
 def send_log(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
-    """Send a fire-and-forget log message to the configured log chat."""
-
     if not config.LOG_CHAT_ID:
         logging.info("Skipping log send; LOG_CHAT_ID not configured: %s", text)
         return
@@ -84,229 +100,304 @@ def send_log(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
     )
 
 
-def is_valid_link(text: str) -> bool:
-    text = text.strip()
-    return text.startswith("https://t.me/") or text.startswith("t.me/") or text.startswith("@")
-
-
-def is_valid_code(text: str) -> bool:
-    return text.isdigit() and 4 <= len(text) <= 8
-
-
-def friendly_error(message: str) -> str:
-    return f"⚠️ {message}\nChoose an option below or try again."
-
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Welcome users and guide them to the report helper."""
-
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     greeting = (
-        "👋 Hi! I'm an educational helper that demonstrates Telegram reporting flows.\n"
-        "• I can ask for passwords, login codes, and session strings (demo only).\n"
-        "• I can prepare a report on behalf of any user.\n"
-        "Please report only genuine abuse and avoid sharing real secrets."
+        "👋 Welcome! I coordinate Pyrogram sessions to report illegal content.\n"
+        "• Share a Telegram link and up to 5 reasons.\n"
+        "• Minimum sessions: 5. Maximum: 500.\n"
+        "• Default report count: 5000 requests.\n"
+        "Use /report to begin or buttons below."
     )
-    await update.effective_message.reply_text(
-        greeting, reply_markup=main_menu_keyboard(), parse_mode=ParseMode.MARKDOWN
-    )
-    await update.effective_message.reply_text(
-        "Tap a report type to begin or use /help for instructions."
-    )
-    return ConversationHandler.WAITING
+    await update.effective_message.reply_text(greeting, reply_markup=main_menu_keyboard())
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = (
-        "ℹ️ *Report helper guide*\n"
-        "1) Pick what you want to report (user, group, channel, story).\n"
-        "2) Share the profile/invite link.\n"
-        "3) Tell me why you're reporting and provide evidence links.\n"
-        "4) I'll ask for password, login code, and session string (educational).\n"
-        "5) I send a summary back to you and log the attempt.\n\n"
-        "Use /report_help to start or /cancel to exit."
+        "ℹ️ *How to use the reporter*\n"
+        "1) Run /report or tap Start report.\n"
+        "2) Send the profile, group, or channel link.\n"
+        "3) List up to 5 reasons (one per line).\n"
+        "4) Accept 5000 reports or enter a custom count.\n"
+        "5) Paste 5-500 Pyrogram session strings or type 'use saved'.\n"
+        "I will track successes, failures, and times, then store the run in MongoDB."
     )
     await update.effective_message.reply_text(message, parse_mode=ParseMode.MARKDOWN)
 
 
-async def start_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Entry point for the report conversation."""
-
-    await update.effective_message.reply_text(
-        "What would you like to report? Choose an option.", reply_markup=main_menu_keyboard()
-    )
-    context.user_data.clear()
-    return SELECT_TYPE
-
-
-async def handle_report_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def handle_action_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
-    _, report_type = query.data.split(":", maxsplit=1)
-    context.user_data["report_type"] = report_type
+    if query.data == "action:start":
+        return await start_report(update, context)
+    if query.data == "action:add":
+        await query.edit_message_text("Send 5-500 Pyrogram session strings, one per line.")
+        return ADD_SESSIONS
+    return ConversationHandler.END
 
-    timestamp = datetime.now(timezone.utc).isoformat()
-    user = update.effective_user
-    username = f"@{user.username}" if user and user.username else "(no username)"
-    send_log(
-        context,
-        f"New report flow: {report_type} | user_id={user.id if user else 'unknown'} | "
-        f"username={username} | ts={timestamp}",
+
+async def start_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.clear()
+    await update.effective_message.reply_text(
+        "Send the Telegram link you want to report (https://t.me/... or @username)."
     )
-
-    await query.edit_message_text(
-        (
-            f"Reporting a {report_type}.\n"
-            "Send the profile or invite link (https://t.me/... or @username).\n"
-            "If you send something else, I'll remind you and show the options again."
-        ),
-        reply_markup=None,
-    )
-    return ASK_TARGET
+    return REPORT_URL
 
 
-async def ask_target(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    link = (update.message.text or "").strip()
-    if not is_valid_link(link):
+async def handle_report_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = (update.message.text or "").strip()
+    if not is_valid_link(text):
         await update.effective_message.reply_text(
             friendly_error("Invalid link. Use https://t.me/... or @username."),
             reply_markup=main_menu_keyboard(),
         )
-        return SELECT_TYPE
+        return ConversationHandler.END
 
-    context.user_data["target_link"] = link
+    context.user_data["target"] = text
     await update.effective_message.reply_text(
-        "Got it. Briefly describe the abuse you're reporting (1-2 sentences)."
+        "List up to 5 reasons for reporting (one per line or separated by semicolons)."
     )
-    return ASK_REASON
+    return REPORT_REASONS
 
 
-async def ask_reason(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    reason = (update.message.text or "").strip()
-    if len(reason) < 4:
-        await update.effective_message.reply_text(
-            friendly_error("That reason is too short. Please add a bit more detail."),
-        )
-        return ASK_REASON
+async def handle_reasons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    reasons = parse_reasons(update.message.text or "")
+    if not reasons:
+        await update.effective_message.reply_text(friendly_error("Please provide at least one reason."))
+        return REPORT_REASONS
 
-    context.user_data["reason"] = reason
+    context.user_data["reasons"] = reasons
     await update.effective_message.reply_text(
-        "Share a message link or evidence URL (https://...). Type 'skip' to continue."
+        f"How many report requests? Send a number or type 'default' for {DEFAULT_REPORTS}."
     )
-    return ASK_EVIDENCE
+    return REPORT_COUNT
 
 
-async def ask_evidence(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    evidence = (update.message.text or "").strip()
-    if evidence.lower() != "skip" and evidence and not evidence.startswith("http"):
-        await update.effective_message.reply_text(
-            friendly_error("Evidence must be a URL (https://...)."),
-        )
-        return ASK_EVIDENCE
+async def handle_report_count(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = (update.message.text or "").strip().lower()
+    if text in {"", "default"}:
+        count = DEFAULT_REPORTS
+    else:
+        if not text.isdigit() or int(text) <= 0:
+            await update.effective_message.reply_text(friendly_error("Please send a positive number."))
+            return REPORT_COUNT
+        count = int(text)
 
-    context.user_data["evidence"] = None if evidence.lower() == "skip" else evidence
+    context.user_data["count"] = count
     await update.effective_message.reply_text(
         (
-            "For this demo I need your *Telegram account password* (do not share a real one).\n"
-            "After that I'll ask for your login code and session string."
+            "Paste 5-500 Pyrogram session strings (one per line).\n"
+            "Type 'use saved' to run with all stored sessions."
+        )
+    )
+    return REPORT_SESSIONS
+
+
+async def handle_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = (update.message.text or "").strip()
+    sessions: list[str] = []
+
+    if text.lower() == "use saved":
+        sessions = await data_store.get_sessions()
+        if len(sessions) < MIN_SESSIONS:
+            await update.effective_message.reply_text(
+                friendly_error(
+                    f"Not enough saved sessions. Add at least {MIN_SESSIONS} with /addsessions or paste them now."
+                )
+            )
+            return REPORT_SESSIONS
+    else:
+        sessions = session_strings_from_text(text)
+        if not (MIN_SESSIONS <= len(sessions) <= MAX_SESSIONS):
+            await update.effective_message.reply_text(
+                friendly_error(
+                    f"Provide between {MIN_SESSIONS} and {MAX_SESSIONS} session strings (one per line)."
+                )
+            )
+            return REPORT_SESSIONS
+        added = await data_store.add_sessions(
+            sessions, added_by=update.effective_user.id if update.effective_user else None
+        )
+        await update.effective_message.reply_text(
+            f"Stored {len(added)} new session(s). {len(sessions)} will be used for this run."
+        )
+
+    context.user_data["sessions"] = sessions
+
+    summary = (
+        f"Target: {context.user_data.get('target')}\n"
+        f"Reasons: {', '.join(context.user_data.get('reasons', []))}\n"
+        f"Total reports: {context.user_data.get('count')}\n"
+        f"Session count: {len(sessions)}"
+    )
+
+    await update.effective_message.reply_text(
+        f"Confirm the report?\n\n{summary}",
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("Start", callback_data="confirm:start")],
+                [InlineKeyboardButton("Cancel", callback_data="confirm:cancel")],
+            ]
         ),
-        parse_mode=ParseMode.MARKDOWN,
     )
-    return ASK_PASSWORD
+    return ConversationHandler.WAITING
 
 
-async def ask_password(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    password = (update.message.text or "").strip()
-    if not password:
-        await update.effective_message.reply_text(friendly_error("Please provide some password text."))
-        return ASK_PASSWORD
+async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    if query.data == "confirm:cancel":
+        await query.edit_message_text("Canceled. Use /report to start over.")
+        return ConversationHandler.END
 
-    context.user_data["password"] = password
-    await update.effective_message.reply_text(
-        "Next, share the Telegram login code you received (numbers only)."
-    )
-    return ASK_CODE
-
-
-async def ask_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    code = (update.message.text or "").strip()
-    if not is_valid_code(code):
-        await update.effective_message.reply_text(
-            friendly_error("Login code should be 4-8 digits. Please re-enter."),
-        )
-        return ASK_CODE
-
-    context.user_data["code"] = code
-    await update.effective_message.reply_text(
-        "Finally, share your session string (any text will do for this demo)."
-    )
-    return ASK_SESSION
-
-
-async def ask_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    session_text = (update.message.text or "").strip()
-    if not session_text:
-        await update.effective_message.reply_text(
-            friendly_error("Session string cannot be empty. Please provide some text."),
-        )
-        return ASK_SESSION
-
-    context.user_data["session"] = session_text
-    await send_summary(update, context)
+    await query.edit_message_text("Reporting has started. I'll send updates when done.")
+    asyncio.create_task(run_report_job(query, context))
     return ConversationHandler.END
 
 
-async def send_summary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    data: Dict[str, str] = context.user_data
-    summary_lines = [
-        "✅ Report assembled (educational only).",
-        f"Type: {data.get('report_type', 'n/a')}",
-        f"Target: {data.get('target_link', 'n/a')}",
-        f"Reason: {data.get('reason', 'n/a')}",
-        f"Evidence: {data.get('evidence') or 'not provided'}",
-        "Security prompts were answered (password, login code, session string).",
-        "I'll forward this to the moderators."
-    ]
-    summary_text = "\n".join(summary_lines)
-    await update.effective_message.reply_text(summary_text)
+async def run_report_job(query, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = query.from_user
+    chat_id = query.message.chat_id
 
-    # Send a log with sensitive fields redacted.
+    target = context.user_data.get("target")
+    reasons = context.user_data.get("reasons", [])
+    count = context.user_data.get("count", DEFAULT_REPORTS)
+    sessions = context.user_data.get("sessions", [])
+
+    started = datetime.now(timezone.utc)
+    await context.bot.send_message(chat_id=chat_id, text="Preparing clients...")
+
+    summary = await perform_reporting(target, reasons, count, sessions)
+    ended = datetime.now(timezone.utc)
+
+    summary_text = (
+        "✅ Reporting finished.\n"
+        f"Target: {target}\n"
+        f"Reasons: {', '.join(reasons)}\n"
+        f"Requested: {count}\n"
+        f"Sessions used: {len(sessions)}\n"
+        f"Success: {summary['success']} | Failed: {summary['failed']}\n"
+        f"Started: {started.isoformat()}\n"
+        f"Ended: {ended.isoformat()}"
+    )
+
+    await context.bot.send_message(chat_id=chat_id, text=summary_text)
+
+    await data_store.record_report(
+        {
+            "user_id": user.id if user else None,
+            "target": target,
+            "reasons": reasons,
+            "requested": count,
+            "sessions": len(sessions),
+            "success": summary["success"],
+            "failed": summary["failed"],
+            "started_at": started,
+            "ended_at": ended,
+        }
+    )
+
     send_log(
         context,
         (
-            "Report summary (redacted): "
-            f"type={data.get('report_type')} | target={data.get('target_link')} | "
-            f"reason={data.get('reason')} | evidence={data.get('evidence') or 'none'}"
+            f"Report run finished: user_id={user.id if user else 'unknown'} | target={target} | "
+            f"success={summary['success']} | failed={summary['failed']}"
         ),
     )
 
 
-async def admin_notice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_user or update.effective_user.id not in config.ADMIN_USER_IDS:
-        await update.effective_message.reply_text("Only admins can use this command.")
-        return
+async def resolve_chat_id(client: Client, target: str):
+    identifier = extract_target_identifier(target)
+    chat = await client.get_chat(identifier)
+    return chat.id
 
+
+async def perform_reporting(target: str, reasons: Iterable[str], total: int, sessions: list[str]) -> dict:
+    ensure_pyrogram_creds()
+
+    clients = [
+        Client(
+            name=f"reporter_{idx}",
+            api_id=config.API_ID,
+            api_hash=config.API_HASH,
+            session_string=session,
+            workdir=f"/tmp/report_session_{idx}",
+        )
+        for idx, session in enumerate(sessions)
+    ]
+
+    reason_text = "; ".join(reasons)[:512] or "No reason provided"
+
+    try:
+        for client in clients:
+            await client.start()
+
+        chat_id = await resolve_chat_id(clients[0], target)
+
+        success = 0
+        failed = 0
+
+        async def report_once(client: Client) -> bool:
+            try:
+                return await report_profile_photo(client, chat_id, reason=5, reason_text=reason_text)
+            except FloodWait as fw:
+                await asyncio.sleep(getattr(fw, "value", 1))
+                try:
+                    return await report_profile_photo(client, chat_id, reason=5, reason_text=reason_text)
+                except Exception:
+                    return False
+            except (BadRequest, RPCError):
+                return False
+
+        tasks = []
+        for i in range(total):
+            client = clients[i % len(clients)]
+            tasks.append(asyncio.create_task(report_once(client)))
+
+        if tasks:
+            for result in await asyncio.gather(*tasks):
+                if result:
+                    success += 1
+                else:
+                    failed += 1
+
+        return {"success": success, "failed": failed}
+
+    finally:
+        for client in clients:
+            try:
+                await client.stop()
+            except Exception:
+                pass
+
+
+async def handle_add_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.effective_message.reply_text(
-        "Admin shortcuts available. Use buttons for quick actions.", reply_markup=admin_keyboard()
+        f"Send between {MIN_SESSIONS} and {MAX_SESSIONS} Pyrogram session strings (one per line)."
     )
+    return ADD_SESSIONS
 
 
-async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    if query.data == "admin:notice":
-        await query.edit_message_text(
-            (
-                "Educational reminder: this bot demonstrates collecting passwords, "
-                "login codes, and session strings. Never share real secrets outside "
-                "official Telegram apps."
+async def receive_added_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    sessions = session_strings_from_text(update.message.text or "")
+    if not (MIN_SESSIONS <= len(sessions) <= MAX_SESSIONS):
+        await update.effective_message.reply_text(
+            friendly_error(
+                f"Please provide between {MIN_SESSIONS} and {MAX_SESSIONS} sessions."
             )
         )
+        return ADD_SESSIONS
+
+    added = await data_store.add_sessions(
+        sessions, added_by=update.effective_user.id if update.effective_user else None
+    )
+    await update.effective_message.reply_text(
+        f"Stored {len(added)} new session(s). Total available: {len(await data_store.get_sessions())}."
+    )
+    return ConversationHandler.END
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.effective_message.reply_text(
-        "Conversation canceled. Use /report_help to start over.", reply_markup=main_menu_keyboard()
-    )
+    await update.effective_message.reply_text("Canceled. Use /report to begin again.")
     return ConversationHandler.END
 
 
@@ -326,25 +417,33 @@ def build_app() -> Application:
     )
 
     report_conversation = ConversationHandler(
-        entry_points=[CommandHandler("report_help", start_report)],
+        entry_points=[
+            CommandHandler("report", start_report),
+            CallbackQueryHandler(handle_action_buttons, pattern=r"^action:"),
+        ],
         states={
-            SELECT_TYPE: [CallbackQueryHandler(handle_report_type, pattern=r"^type:")],
-            ASK_TARGET: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_target)],
-            ASK_REASON: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_reason)],
-            ASK_EVIDENCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_evidence)],
-            ASK_PASSWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_password)],
-            ASK_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_code)],
-            ASK_SESSION: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_session)],
+            REPORT_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_report_url)],
+            REPORT_REASONS: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_reasons)],
+            REPORT_COUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_report_count)],
+            REPORT_SESSIONS: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_sessions)],
+            ADD_SESSIONS: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_added_sessions)],
+            ConversationHandler.WAITING: [CallbackQueryHandler(handle_confirmation, pattern=r"^confirm:")],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
         allow_reentry=True,
     )
 
+    add_sessions_conv = ConversationHandler(
+        entry_points=[CommandHandler("addsessions", handle_add_sessions)],
+        states={ADD_SESSIONS: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_added_sessions)]},
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("admin", admin_notice))
+    application.add_handler(add_sessions_conv)
     application.add_handler(report_conversation)
-    application.add_handler(CallbackQueryHandler(handle_admin_callback, pattern=r"^admin:"))
+    application.add_handler(CallbackQueryHandler(handle_confirmation, pattern=r"^confirm:"))
 
     application.add_error_handler(error_handler)
     return application
@@ -360,6 +459,7 @@ async def main() -> None:
     await app.updater.idle()
     await app.stop()
     await app.shutdown()
+    await data_store.close()
 
 
 if __name__ == "__main__":

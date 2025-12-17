@@ -55,7 +55,7 @@ async def run_report_job(query, context: ContextTypes.DEFAULT_TYPE, job_data: di
                     invite_link=job_data.get("invite_link"),
                 )
             except Exception as exc:  # pragma: no cover - runtime safety
-                logging.exception("Failed to complete reporting job")
+                logging.exception("Failed to complete reporting job for target '%s'", target)
                 summary = {"success": 0, "failed": 0, "halted": True, "error": str(exc)}
 
             ended = datetime.now(timezone.utc)
@@ -137,6 +137,7 @@ async def perform_reporting(
             clients.append(client)
         except Exception:
             failed_sessions += 1
+            logging.exception("Failed to start client %s during reporting", client.name)
 
     if not clients:
         return {"success": 0, "failed": 0, "halted": True, "error": "No sessions could be started"}
@@ -152,15 +153,18 @@ async def perform_reporting(
                 chat_id = await resolve_chat_id(client, target, invite_link)
                 break
             except UsernameNotOccupied:
+                logging.warning("Username not occupied while resolving '%s' via %s", target, client.name)
                 last_error = (
                     "The username or link appears to be unoccupied or deleted. "
                     "Please verify the target and try again."
                 )
                 continue
             except BadRequest as exc:
+                logging.warning("Bad request resolving '%s' via %s: %s", target, client.name, exc)
                 last_error = f"The link '{target}' is not valid: {exc}."
                 break
             except RPCError as exc:
+                logging.warning("RPC error resolving '%s' via %s: %s", target, client.name, exc)
                 last_error = f"Could not resolve '{target}' ({exc})."
                 continue
 
@@ -183,7 +187,7 @@ async def perform_reporting(
                     except Exception:
                         pass
                 except Exception:
-                    pass
+                    logging.exception("Failed to join invite link '%s' with %s", invite_link, client.name)
 
         success = 0
         failed = 0
@@ -195,13 +199,17 @@ async def perform_reporting(
             try:
                 return await report_profile_photo(client, chat_id, reason=reason_code, reason_text=reason_text)
             except FloodWait as fw:
-                await asyncio.sleep(getattr(fw, "value", 1))
+                wait_for = getattr(fw, "value", 1)
+                logging.warning("Flood wait %ss while reporting %s via %s", wait_for, target, client.name)
+                await asyncio.sleep(wait_for)
                 try:
                     return await report_profile_photo(client, chat_id, reason=reason_code, reason_text=reason_text)
                 except Exception:
+                    logging.exception("Retry after flood wait failed for %s via %s", target, client.name)
                     return False
-            except (BadRequest, RPCError):
+            except (BadRequest, RPCError) as exc:
                 halted = True
+                logging.error("Halting report run due to RPC/BadRequest error for %s via %s: %s", target, client.name, exc)
                 return False
 
         worker_count = max(1, min(max_concurrency, total, len(clients)))

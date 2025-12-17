@@ -6,6 +6,7 @@ Fill the values below with your BOT TOKEN, API ID, API HASH, and MONGO URI
 before deploying. This avoids mistakes with environment variables.
 """
 
+import os
 from typing import Final
 
 # -----------------------------------------------------------
@@ -18,6 +19,10 @@ API_ID: Final[int] = 27989579        # ← Enter your API ID (integer)
 API_HASH: Final[str] = "64742ebe270a7d202150134d66397839"
 
 MONGO_URI: Final[str] = "mongodb+srv://annieregain:firstowner8v@anniere.ht2en.mongodb.net/?retryWrites=true&w=majority&appName=AnnieRE"
+
+# Comma-separated Telegram user IDs that are allowed to issue admin commands
+# (e.g., /restart). Example: ADMIN_IDS="123,456".
+ADMIN_IDS: Final[set[int]] = {int(value) for value in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if value.isdigit()}
 
 # -----------------------------------------------------------
 #  (Optional) Author Verification — keep or remove as needed

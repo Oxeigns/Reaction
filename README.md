@@ -84,12 +84,23 @@ python main.py
 2. Set Config Vars: `BOT_TOKEN`, `API_ID`, `API_HASH`, and `MONGO_URI` (if available).
 3. Deploy the repository (the included `Procfile` already defines the worker dyno: `worker: python main.py`).
 4. Scale the worker dyno: `heroku ps:scale worker=1`.
+5. Optional: set `ADMIN_IDS` (comma-separated Telegram user IDs) to allow trusted operators to issue `/restart`.
+
+### Reliability tips for Heroku
+- Keep only one worker dyno running to avoid duplicate schedulers and duplicate polling.
+- Disable automatic deploys if you see continuous build/release loops after every commit; instead deploy only known-good revisions.
+- If Telegram connectivity is flaky, the bot now retries with exponential backoff instead of crashing the dyno.
+- Provide a `SOURCE_VERSION`, `HEROKU_RELEASE_VERSION`, or `GIT_REV` config var to surface the running version in `/uptime`.
+- Prefer a Hobby dyno or larger if the free/basic tiers restart too frequently; add a simple Pingdom/Upptime health check against `/ping` to spot issues early.
 
 ## Bot commands
 - `/start` – open the control panel.
 - `/report` – begin a guided report (collects API credentials, sessions, target links, report type, reason, and count).
 - `/addsessions` – store additional session strings.
 - `/sessions` – view saved and currently loaded sessions.
+- `/uptime` – show process uptime, server time, and build/version.
+- `/ping` – measure Telegram round-trip latency with CPU/memory usage.
+- `/restart` – admin-only graceful restart of the worker.
 - `/help` – show usage instructions.
 - `/cancel` – abort the current flow.
 

@@ -53,10 +53,13 @@ from bot.handlers import (
     handle_story_url,
     handle_target_kind,
     help_command,
+    ping_command,
+    restart_command,
     receive_added_sessions,
     show_sessions,
     start,
     start_report,
+    uptime_command,
 )
 
 
@@ -109,6 +112,9 @@ def build_app() -> Application:
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("uptime", uptime_command))
+    application.add_handler(CommandHandler("ping", ping_command))
+    application.add_handler(CommandHandler("restart", restart_command))
     application.add_handler(CommandHandler("sessions", show_sessions))
     application.add_handler(add_sessions_conv)
     application.add_handler(report_conversation)
@@ -121,24 +127,41 @@ def build_app() -> Application:
 
 async def run_polling(application: Application, shutdown_event: asyncio.Event) -> None:
     """Run the bot until ``shutdown_event`` is set."""
+    backoff_seconds = 1
     # Application lifecycle is managed explicitly so every coroutine is awaited
     # and the single asyncio loop owned by ``asyncio.run`` stays in control. This
     # avoids "shutdown was never awaited" warnings and prevents closing a loop
     # that is still running.
-    try:
-        logging.info("Bot started and polling.")
-        await application.initialize()
-        await application.start()
-        await application.updater.start_polling()
+    while not shutdown_event.is_set():
+        try:
+            logging.info("Bot starting polling cycle.")
+            await application.initialize()
+            await application.start()
+            await application.updater.start_polling()
 
-        await shutdown_event.wait()
-    except NetworkError as exc:
-        logging.error("Failed to connect to Telegram: %s", exc)
-        raise SystemExit(1) from exc
-    finally:
-        await application.updater.stop()
-        await application.stop()
-        await application.shutdown()
+            logging.info("Bot started and polling.")
+            backoff_seconds = 1
+            await shutdown_event.wait()
+        except asyncio.CancelledError:
+            raise
+        except NetworkError as exc:
+            logging.warning("Telegram network error: %s. Retrying in %s seconds.", exc, backoff_seconds)
+        except Exception:
+            logging.exception("Polling crashed unexpectedly. Retrying in %s seconds.", backoff_seconds)
+        finally:
+            try:
+                await application.updater.stop()
+                await application.stop()
+                await application.shutdown()
+            except Exception:
+                logging.exception("Error while shutting down application components")
+
+        if shutdown_event.is_set():
+            logging.info("Shutdown event set; exiting polling loop.")
+            break
+
+        await asyncio.sleep(backoff_seconds)
+        backoff_seconds = min(backoff_seconds * 2, 60)
 
 
 __all__ = ["build_app", "run_polling"]

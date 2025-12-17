@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import logging
+import os
+import sys
+import time
 from copy import deepcopy
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -30,6 +33,8 @@ from bot.constants import (
     TARGET_KIND,
 )
 from bot.dependencies import API_HASH, API_ID, data_store
+from bot.health import format_duration, process_health
+from bot.scheduler import SchedulerManager
 from bot.reporting import run_report_job
 from bot.state import active_session_count, flow_state, profile_state, reset_flow_state, saved_session_count
 from bot.ui import main_menu_keyboard, reason_keyboard, render_greeting, session_mode_keyboard, target_kind_keyboard
@@ -68,6 +73,58 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "I will show successes, failures, time taken, and stop automatically if the content disappears."
     )
     await update.effective_message.reply_text(message, parse_mode=ParseMode.MARKDOWN)
+
+
+def _is_admin(update: Update) -> bool:
+    user_id = update.effective_user.id if update.effective_user else None
+    return bool(user_id and user_id in getattr(config, "ADMIN_IDS", set()))
+
+
+async def uptime_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    snapshot = process_health()
+    uptime_text = format_duration(snapshot["uptime_seconds"])
+    message = (
+        f"⏱ Uptime: {uptime_text}\n"
+        f"🕒 Server time: {snapshot['server_time']}\n"
+        f"🔖 Version: {snapshot['version']}\n"
+        f"⚙️ CPU: {snapshot['cpu_percent']:.1f}%\n"
+        f"🧠 Memory: {snapshot['memory_mb']:.1f} MB"
+    )
+    await update.effective_message.reply_text(message)
+
+
+async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    sent_at = time.perf_counter()
+    message = await update.effective_message.reply_text("Pinging Telegram…")
+    latency_ms = (time.perf_counter() - sent_at) * 1000
+
+    snapshot = process_health()
+    await message.edit_text(
+        "\n".join(
+            [
+                f"🏓 Pong! {latency_ms:.0f} ms",
+                f"⚙️ CPU: {snapshot['cpu_percent']:.1f}%",
+                f"🧠 Memory: {snapshot['memory_mb']:.1f} MB",
+                f"⏱ Uptime: {format_duration(snapshot['uptime_seconds'])}",
+            ]
+        )
+    )
+
+
+async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _is_admin(update):
+        await update.effective_message.reply_text("You are not authorized to restart this bot.")
+        return
+
+    await update.effective_message.reply_text("Restarting… I will be back shortly.")
+    SchedulerManager.shutdown()
+    context.bot_data["restart_requested"] = True
+    shutdown_event = context.bot_data.get("shutdown_event")
+    if shutdown_event:
+        shutdown_event.set()
+    else:
+        # Fallback to exiting if no shutdown hook is registered
+        os.execv(sys.executable, [sys.executable, *sys.argv])
 
 
 async def show_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -451,4 +508,7 @@ __all__ = [
     "receive_added_sessions",
     "cancel",
     "error_handler",
+    "uptime_command",
+    "ping_command",
+    "restart_command",
 ]

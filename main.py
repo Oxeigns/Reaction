@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import signal
+import sys
 
 import config
 from bot.app_builder import build_app, run_polling
@@ -33,6 +35,11 @@ def _setup_signal_handlers(loop: asyncio.AbstractEventLoop, shutdown_event: asyn
             signal.signal(getattr(signal, signame), lambda *_: shutdown_event.set())
 
 
+def _restart_process() -> None:
+    logging.info("Restart requested; re-executing process with same args.")
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
 async def main_async() -> None:
     """Entrypoint used by asyncio.run."""
 
@@ -41,6 +48,9 @@ async def main_async() -> None:
 
     app = build_app()
     shutdown_event = asyncio.Event()
+
+    app.bot_data["shutdown_event"] = shutdown_event
+    app.bot_data.setdefault("restart_requested", False)
 
     loop = asyncio.get_running_loop()
     SchedulerManager.set_event_loop(loop)
@@ -52,6 +62,9 @@ async def main_async() -> None:
     finally:
         SchedulerManager.shutdown()
         await data_store.close()
+
+    if app.bot_data.get("restart_requested"):
+        _restart_process()
 
 
 def main() -> None:

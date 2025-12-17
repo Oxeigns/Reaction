@@ -382,12 +382,17 @@ async def perform_reporting(
                 except asyncio.QueueEmpty:
                     break
 
-                result = await report_once(client)
-                if result:
-                    success += 1
-                else:
+                try:
+                    result = await report_once(client)
+                    if result:
+                        success += 1
+                    else:
+                        failed += 1
+                except Exception:
                     failed += 1
-                queue.task_done()
+                    logging.exception("Unexpected error while reporting via %s", getattr(client, "name", "unknown"))
+                finally:
+                    queue.task_done()
 
         workers = [asyncio.create_task(worker()) for _ in range(worker_count)]
         await queue.join()

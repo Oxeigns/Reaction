@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-from typing import List
 from urllib.parse import urlparse
 
 from pyrogram import Client
@@ -13,7 +12,7 @@ def friendly_error(message: str) -> str:
     return f"⚠️ {message}\nUse the menu below or try again."
 
 
-def parse_reasons(text: str) -> List[str]:
+def parse_reasons(text: str) -> list[str]:
     reasons = [line.strip() for line in text.replace(";", "\n").splitlines() if line.strip()]
     return reasons[:5]
 

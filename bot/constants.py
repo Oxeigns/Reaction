@@ -25,6 +25,16 @@ MAX_REPORTS = 7000
 MIN_SESSIONS = 1
 MAX_SESSIONS = 500
 
+REASON_LABELS = {
+    0: "Spam",
+    1: "Violence",
+    2: "Pornography",
+    3: "Child abuse",
+    4: "Copyright",
+    5: "Other",
+    6: "Illegal content",
+}
+
 __all__ = [
     "MENU_LIVE_STATUS",
     "API_ID_STATE",
@@ -46,4 +56,5 @@ __all__ = [
     "MAX_REPORTS",
     "MIN_SESSIONS",
     "MAX_SESSIONS",
+    "REASON_LABELS",
 ]

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-from bot.constants import MENU_LIVE_STATUS, MAX_SESSIONS, MIN_SESSIONS
+from bot.constants import MENU_LIVE_STATUS, MAX_SESSIONS, MIN_SESSIONS, REASON_LABELS
 
 
 def main_menu_keyboard(saved_sessions: int = 0, active_sessions: int = 0, live_status: str = MENU_LIVE_STATUS) -> InlineKeyboardMarkup:
@@ -31,12 +31,27 @@ def target_kind_keyboard() -> InlineKeyboardMarkup:
 
 
 def reason_keyboard() -> InlineKeyboardMarkup:
+    """Buttons covering the available Pyrogram/Telegram report reasons."""
+
+    buttons = [
+        InlineKeyboardButton(REASON_LABELS[0], callback_data="reason:0"),
+        InlineKeyboardButton(REASON_LABELS[3], callback_data="reason:3"),
+        InlineKeyboardButton(REASON_LABELS[2], callback_data="reason:2"),
+        InlineKeyboardButton(REASON_LABELS[1], callback_data="reason:1"),
+        InlineKeyboardButton(REASON_LABELS[6], callback_data="reason:6"),
+        InlineKeyboardButton(REASON_LABELS[4], callback_data="reason:4"),
+        InlineKeyboardButton(REASON_LABELS[5], callback_data="reason:5"),
+    ]
+
+    rows = [
+        buttons[0:2],
+        buttons[2:4],
+        buttons[4:6],
+        [buttons[6]],
+    ]
+
     return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("Spam", callback_data="reason:0"), InlineKeyboardButton("Violence", callback_data="reason:1")],
-            [InlineKeyboardButton("Pornography", callback_data="reason:2"), InlineKeyboardButton("Child abuse", callback_data="reason:3")],
-            [InlineKeyboardButton("Copyright", callback_data="reason:4"), InlineKeyboardButton("Other", callback_data="reason:5")],
-        ]
+        rows
     )
 
 

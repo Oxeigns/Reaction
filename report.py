@@ -32,6 +32,7 @@ def _build_reason(reason: int | object, message: str) -> object:
         3: InputReportReasonChildAbuse,
         4: InputReportReasonCopyright,
         5: InputReportReasonOther,
+        6: InputReportReasonOther,
     }
 
     if hasattr(reason, "write"):

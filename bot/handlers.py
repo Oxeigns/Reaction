@@ -28,6 +28,7 @@ from bot.constants import (
     REPORT_REASON_TYPE,
     REPORT_SESSIONS,
     REPORT_URLS,
+    REASON_LABELS,
     SESSION_MODE,
     STORY_URL,
     TARGET_KIND,
@@ -125,6 +126,18 @@ async def restart_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     else:
         # Fallback to exiting if no shutdown hook is registered
         os.execv(sys.executable, [sys.executable, *sys.argv])
+
+
+REASON_PROMPT = (
+    "Select a report type via the buttons below (Spam, Child abuse, Pornography,"
+    " Violence, Illegal content, Copyright, Other)."
+)
+
+
+def _reason_label(reason_code: int | None) -> str:
+    if reason_code is None:
+        return "Not set"
+    return REASON_LABELS.get(reason_code, str(reason_code))
 
 
 async def show_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -324,7 +337,7 @@ async def handle_private_message_link(update: Update, context: ContextTypes.DEFA
     flow["target_kind"] = "private"
 
     await update.effective_message.reply_text(
-        "Select a report type.", reply_markup=reason_keyboard()
+        REASON_PROMPT, reply_markup=reason_keyboard()
     )
     return REPORT_REASON_TYPE
 
@@ -340,7 +353,7 @@ async def handle_public_message_link(update: Update, context: ContextTypes.DEFAU
     flow["target_kind"] = "public"
 
     await update.effective_message.reply_text(
-        "Select a report type.", reply_markup=reason_keyboard()
+        REASON_PROMPT, reply_markup=reason_keyboard()
     )
     return REPORT_REASON_TYPE
 
@@ -356,7 +369,7 @@ async def handle_story_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     flow["target_kind"] = "story"
 
     await update.effective_message.reply_text(
-        "Select a report type.", reply_markup=reason_keyboard()
+        REASON_PROMPT, reply_markup=reason_keyboard()
     )
     return REPORT_REASON_TYPE
 
@@ -369,7 +382,7 @@ async def handle_report_urls(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     flow_state(context)["targets"] = targets
     await update.effective_message.reply_text(
-        "Select a report type.", reply_markup=reason_keyboard()
+        REASON_PROMPT, reply_markup=reason_keyboard()
     )
     return REPORT_REASON_TYPE
 
@@ -420,7 +433,7 @@ async def handle_report_count(update: Update, context: ContextTypes.DEFAULT_TYPE
     summary = (
         f"Targets: {len(flow.get('targets', []))}\n"
         f"Reasons: {', '.join(flow.get('reasons', []))}\n"
-        f"Report type: {flow.get('reason_code')}\n"
+        f"Report type: {_reason_label(flow.get('reason_code'))}\n"
         f"Total reports each: {flow.get('count')}\n"
         f"Session count: {len(flow.get('sessions', []))}"
     )

@@ -4,17 +4,24 @@ import asyncio
 import logging
 from copy import deepcopy
 from datetime import datetime, timezone
-from typing import Iterable
+from typing import TYPE_CHECKING, Iterable
 
 import config
-from pyrogram import Client
-from pyrogram.errors import BadRequest, FloodWait, RPCError, UsernameNotOccupied
 from telegram.ext import ContextTypes
 
 from bot.constants import DEFAULT_REPORTS
 from bot.dependencies import API_HASH, API_ID, data_store, ensure_pyrogram_creds
 from bot.utils import resolve_chat_id
 from report import report_profile_photo
+
+if TYPE_CHECKING:
+    # Keep type information for editors without importing Pyrogram's sync wrapper
+    # during module import. Pyrogram's top-level import path currently touches
+    # ``asyncio.get_event_loop`` at import time, which raises under Python 3.14
+    # when no loop exists yet. Delaying the import until we are already inside a
+    # running event loop keeps startup stable on Heroku.
+    from pyrogram.client import Client
+    from pyrogram.errors import BadRequest, FloodWait, RPCError, UsernameNotOccupied
 
 
 async def run_report_job(query, context: ContextTypes.DEFAULT_TYPE, job_data: dict) -> None:
@@ -103,6 +110,13 @@ async def perform_reporting(
     invite_link: str | None = None,
 ) -> dict:
     """Send repeated report requests with bounded concurrency."""
+    # Import Pyrogram lazily so we avoid its sync wrapper touching the default
+    # event loop during module import. Python 3.14 tightened ``get_event_loop``
+    # semantics, so we only import once we know an event loop is already
+    # running (inside an async function owned by our single asyncio.run entry).
+    from pyrogram.client import Client
+    from pyrogram.errors import BadRequest, FloodWait, RPCError, UsernameNotOccupied
+
     if not (api_id and api_hash):
         ensure_pyrogram_creds()
         api_id = API_ID

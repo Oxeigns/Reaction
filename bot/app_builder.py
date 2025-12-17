@@ -121,7 +121,10 @@ def build_app() -> Application:
 
 async def run_polling(application: Application, shutdown_event: asyncio.Event) -> None:
     """Run the bot until ``shutdown_event`` is set."""
-
+    # Application lifecycle is managed explicitly so every coroutine is awaited
+    # and the single asyncio loop owned by ``asyncio.run`` stays in control. This
+    # avoids "shutdown was never awaited" warnings and prevents closing a loop
+    # that is still running.
     try:
         logging.info("Bot started and polling.")
         await application.initialize()

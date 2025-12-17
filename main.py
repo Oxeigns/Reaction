@@ -55,6 +55,8 @@ async def main_async() -> None:
 
 
 def main() -> None:
+    # asyncio.run owns the single event loop for the process; avoid creating or
+    # closing additional loops elsewhere to keep startup/shutdown predictable.
     asyncio.run(main_async())
 
 

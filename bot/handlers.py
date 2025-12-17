@@ -327,10 +327,10 @@ async def handle_api_hash(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def handle_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = (update.message.text or "").strip().lower()
+    raw_text = (update.message.text or "").strip()
     profile = profile_state(context)
 
-    if text in {"use saved", "use_saved"}:
+    if raw_text.lower() in {"use saved", "use_saved"}:
         saved_sessions = profile.get("saved_sessions", [])
         if not saved_sessions:
             await update.effective_message.reply_text(
@@ -349,7 +349,7 @@ async def handle_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return TARGET_KIND
 
-    sessions = session_strings_from_text(update.message.text or "")
+    sessions = session_strings_from_text(raw_text)
     if not (MIN_SESSIONS <= len(sessions) <= MAX_SESSIONS):
         await update.effective_message.reply_text(
             friendly_error(f"Please provide between {MIN_SESSIONS} and {MAX_SESSIONS} sessions."),

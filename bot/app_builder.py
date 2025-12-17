@@ -76,6 +76,7 @@ def build_app() -> Application:
         entry_points=[
             CommandHandler("report", start_report),
             CallbackQueryHandler(handle_action_buttons, pattern=r"^action:"),
+            CallbackQueryHandler(handle_session_mode, pattern=r"^session_mode:"),
         ],
         states={
             API_ID_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_api_id)],
@@ -96,7 +97,7 @@ def build_app() -> Application:
         },
         fallbacks=[CommandHandler("cancel", cancel)],
         allow_reentry=True,
-        per_message=False,
+        per_message=True,
         per_chat=True,
         per_user=True,
     )
@@ -105,7 +106,8 @@ def build_app() -> Application:
         entry_points=[CommandHandler("addsessions", handle_add_sessions)],
         states={ADD_SESSIONS: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_added_sessions)]},
         fallbacks=[CommandHandler("cancel", cancel)],
-        per_message=False,
+        allow_reentry=True,
+        per_message=True,
         per_chat=True,
         per_user=True,
     )
@@ -118,6 +120,7 @@ def build_app() -> Application:
     application.add_handler(CommandHandler("sessions", show_sessions))
     application.add_handler(add_sessions_conv)
     application.add_handler(report_conversation)
+    application.add_handler(CallbackQueryHandler(handle_session_mode, pattern=r"^session_mode:"), group=1)
     application.add_handler(CallbackQueryHandler(handle_status_chip, pattern=r"^status:"))
     application.add_handler(CallbackQueryHandler(handle_confirmation, pattern=r"^confirm:"))
 

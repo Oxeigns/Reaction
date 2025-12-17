@@ -37,7 +37,14 @@ from bot.dependencies import API_HASH, API_ID, data_store
 from bot.health import format_duration, process_health
 from bot.scheduler import SchedulerManager
 from bot.reporting import run_report_job
-from bot.state import active_session_count, flow_state, profile_state, reset_flow_state, saved_session_count
+from bot.state import (
+    active_session_count,
+    clear_report_state,
+    flow_state,
+    profile_state,
+    reset_flow_state,
+    saved_session_count,
+)
 from bot.ui import main_menu_keyboard, reason_keyboard, render_greeting, session_mode_keyboard, target_kind_keyboard
 from bot.utils import (
     friendly_error,
@@ -178,6 +185,13 @@ async def handle_session_mode(update: Update, context: ContextTypes.DEFAULT_TYPE
     await query.answer()
 
     profile = profile_state(context)
+    profile.setdefault("saved_sessions", await data_store.get_sessions())
+    flow = flow_state(context)
+
+    if "api_id" not in flow and profile.get("api_id"):
+        flow["api_id"] = profile.get("api_id")
+    if "api_hash" not in flow and profile.get("api_hash"):
+        flow["api_hash"] = profile.get("api_hash")
 
     if query.data == "session_mode:reuse":
         saved_sessions = profile.get("saved_sessions", [])
@@ -188,7 +202,6 @@ async def handle_session_mode(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
             return ConversationHandler.END
 
-        flow = reset_flow_state(context)
         flow["sessions"] = list(saved_sessions)
         await query.edit_message_text(
             "Using your saved sessions. What are you reporting?",
@@ -196,6 +209,7 @@ async def handle_session_mode(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return TARGET_KIND
 
+    flow["sessions"] = []
     await query.edit_message_text(
         f"Send between {MIN_SESSIONS} and {MAX_SESSIONS} Pyrogram session strings (one per line)."
     )
@@ -462,6 +476,7 @@ async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE
     job_data = deepcopy(flow_state(context))
 
     context.application.create_task(run_report_job(query, context, job_data))
+    clear_report_state(context)
     return ConversationHandler.END
 
 

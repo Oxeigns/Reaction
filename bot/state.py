@@ -16,6 +16,12 @@ def reset_flow_state(context: ContextTypes.DEFAULT_TYPE) -> dict:
     return context.user_data["flow"]
 
 
+def clear_report_state(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Remove conversation-specific report data so fresh runs start cleanly."""
+    context.user_data.pop("flow", None)
+    context.user_data.pop("report", None)
+
+
 def saved_session_count(context: ContextTypes.DEFAULT_TYPE) -> int:
     return len(profile_state(context).get("saved_sessions", []))
 
@@ -27,6 +33,7 @@ __all__ = [
     "profile_state",
     "flow_state",
     "reset_flow_state",
+    "clear_report_state",
     "saved_session_count",
     "active_session_count",
 ]

@@ -1,0 +1,454 @@
+from __future__ import annotations
+
+import logging
+from copy import deepcopy
+
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ParseMode
+from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes, ConversationHandler, MessageHandler, filters
+
+import config
+from bot.constants import (
+    ADD_SESSIONS,
+    API_HASH_STATE,
+    API_ID_STATE,
+    DEFAULT_REPORTS,
+    MAX_REPORTS,
+    MAX_SESSIONS,
+    MIN_REPORTS,
+    MIN_SESSIONS,
+    PRIVATE_INVITE,
+    PRIVATE_MESSAGE,
+    PUBLIC_MESSAGE,
+    REPORT_COUNT,
+    REPORT_MESSAGE,
+    REPORT_REASON_TYPE,
+    REPORT_SESSIONS,
+    REPORT_URLS,
+    SESSION_MODE,
+    STORY_URL,
+    TARGET_KIND,
+)
+from bot.dependencies import API_HASH, API_ID, data_store
+from bot.reporting import run_report_job
+from bot.state import active_session_count, flow_state, profile_state, reset_flow_state, saved_session_count
+from bot.ui import main_menu_keyboard, reason_keyboard, render_greeting, session_mode_keyboard, target_kind_keyboard
+from bot.utils import (
+    friendly_error,
+    is_valid_link,
+    parse_links,
+    parse_reasons,
+    parse_telegram_url,
+    session_strings_from_text,
+)
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    profile = profile_state(context)
+    profile.setdefault("saved_sessions", await data_store.get_sessions())
+
+    greeting = render_greeting()
+
+    await update.effective_message.reply_text(
+        greeting,
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=main_menu_keyboard(len(profile["saved_sessions"]), active_session_count(context)),
+    )
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = (
+        "ℹ️ *How to use the reporter*\n"
+        "1) Run /report or tap Start report.\n"
+        "2) Provide your API ID and API Hash.\n"
+        "3) Add 1-500 Pyrogram session strings (or type 'use saved').\n"
+        "4) Pick what you are reporting (private group, public group/channel, or profile/story).\n"
+        "5) Send up to 5 Telegram URLs, choose a report type, and write a short reason.\n"
+        "6) Choose 500-7000 report attempts (default 5000).\n"
+        "I will show successes, failures, time taken, and stop automatically if the content disappears."
+    )
+    await update.effective_message.reply_text(message, parse_mode=ParseMode.MARKDOWN)
+
+
+async def show_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    saved = len(await data_store.get_sessions())
+    active = active_session_count(context)
+    await update.effective_message.reply_text(
+        f"Saved sessions: {saved}\nCurrently loaded for this chat: {active}",
+        reply_markup=main_menu_keyboard(saved, active),
+    )
+
+
+async def handle_action_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    if query.data == "action:start":
+        return await start_report(update, context)
+    if query.data == "action:add":
+        await query.edit_message_text(f"Send {MIN_SESSIONS}-{MAX_SESSIONS} Pyrogram session strings, one per line.")
+        return ADD_SESSIONS
+    if query.data == "action:sessions":
+        saved = len(await data_store.get_sessions())
+        active = active_session_count(context)
+        await query.edit_message_text(
+            f"Saved sessions: {saved}\nCurrently loaded for this chat: {active}",
+            reply_markup=main_menu_keyboard(saved, active),
+        )
+        return ConversationHandler.END
+    return ConversationHandler.END
+
+
+async def handle_status_chip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer("Live status indicators — you are already in the dark UI.", show_alert=False)
+
+
+async def handle_session_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    profile = profile_state(context)
+
+    if query.data == "session_mode:reuse":
+        saved_sessions = profile.get("saved_sessions", [])
+        if not saved_sessions:
+            await query.edit_message_text(
+                friendly_error("No saved sessions available. Please add new sessions to continue."),
+                reply_markup=main_menu_keyboard(len(saved_sessions), active_session_count(context)),
+            )
+            return ConversationHandler.END
+
+        flow = reset_flow_state(context)
+        flow["sessions"] = list(saved_sessions)
+        await query.edit_message_text(
+            "Using your saved sessions. What are you reporting?",
+            reply_markup=target_kind_keyboard(),
+        )
+        return TARGET_KIND
+
+    await query.edit_message_text(
+        f"Send between {MIN_SESSIONS} and {MAX_SESSIONS} Pyrogram session strings (one per line)."
+    )
+    return REPORT_SESSIONS
+
+
+async def start_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    profile = profile_state(context)
+    flow = reset_flow_state(context)
+
+    profile.setdefault("saved_sessions", await data_store.get_sessions())
+
+    saved_api_id = profile.get("api_id") or config.API_ID
+    saved_api_hash = profile.get("api_hash") or config.API_HASH
+
+    if saved_api_id and saved_api_hash:
+        flow["api_id"] = saved_api_id
+        flow["api_hash"] = saved_api_hash
+        profile["api_id"] = saved_api_id
+        profile["api_hash"] = saved_api_hash
+        await update.effective_message.reply_text(
+            "Using your saved API credentials. Select a session mode to continue.",
+            reply_markup=session_mode_keyboard(),
+        )
+        return SESSION_MODE
+
+    await update.effective_message.reply_text("Enter your API ID (integer).")
+    return API_ID_STATE
+
+
+async def handle_api_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = (update.message.text or "").strip()
+    if not text.isdigit():
+        await update.effective_message.reply_text("Please provide a valid integer API ID.")
+        return API_ID_STATE
+
+    api_id = int(text)
+    flow_state(context)["api_id"] = api_id
+    profile_state(context)["api_id"] = api_id
+
+    await update.effective_message.reply_text("Enter your API Hash (keep it secret).")
+    return API_HASH_STATE
+
+
+async def handle_api_hash(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    api_hash = (update.message.text or "").strip()
+    if len(api_hash) < 10:
+        await update.effective_message.reply_text("API Hash seems too short. Please re-enter it.")
+        return API_HASH_STATE
+
+    flow_state(context)["api_hash"] = api_hash
+    profile_state(context)["api_hash"] = api_hash
+
+    await update.effective_message.reply_text(
+        f"Send between {MIN_SESSIONS} and {MAX_SESSIONS} Pyrogram session strings (one per line), or type 'use saved' to reuse stored ones."
+    )
+    return REPORT_SESSIONS
+
+
+async def handle_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = (update.message.text or "").strip().lower()
+    profile = profile_state(context)
+
+    if text in {"use saved", "use_saved"}:
+        saved_sessions = profile.get("saved_sessions", [])
+        if not saved_sessions:
+            await update.effective_message.reply_text(
+                friendly_error("No saved sessions available. Please enter new sessions."),
+                reply_markup=main_menu_keyboard(len(saved_sessions), active_session_count(context)),
+            )
+            return ConversationHandler.END
+
+        flow = flow_state(context)
+        flow["sessions"] = list(saved_sessions)
+        await update.effective_message.reply_text("Using your saved sessions. What are you reporting?", reply_markup=target_kind_keyboard())
+        return TARGET_KIND
+
+    sessions = session_strings_from_text(update.message.text or "")
+    if not (MIN_SESSIONS <= len(sessions) <= MAX_SESSIONS):
+        await update.effective_message.reply_text(
+            friendly_error(f"Please provide between {MIN_SESSIONS} and {MAX_SESSIONS} sessions."),
+            reply_markup=main_menu_keyboard(saved_session_count(context), active_session_count(context)),
+        )
+        return REPORT_SESSIONS
+
+    flow = flow_state(context)
+    flow["sessions"] = sessions
+    await update.effective_message.reply_text("What are you reporting?", reply_markup=target_kind_keyboard())
+    return TARGET_KIND
+
+
+async def handle_target_kind(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "kind:private":
+        await query.edit_message_text("Send the private invite link (https://t.me/+code)")
+        return PRIVATE_INVITE
+
+    if query.data == "kind:public":
+        await query.edit_message_text("Send the public message link (https://t.me/username/1234)")
+        return PUBLIC_MESSAGE
+
+    await query.edit_message_text("Send the story URL or username.")
+    return STORY_URL
+
+
+async def handle_private_invite(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = (update.message.text or "").strip()
+    try:
+        parsed = parse_telegram_url(text)
+    except Exception:
+        await update.effective_message.reply_text("Please send a valid private invite link (https://t.me/+code)")
+        return PRIVATE_INVITE
+
+    if parsed.get("type") != "invite":
+        await update.effective_message.reply_text("Please send a valid private invite link (https://t.me/+code)")
+        return PRIVATE_INVITE
+
+    flow_state(context)["invite_link"] = parsed.get("invite_link")
+    await update.effective_message.reply_text("Now send the private message link (https://t.me/c/123456789/45)")
+    return PRIVATE_MESSAGE
+
+
+async def handle_private_message_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = (update.message.text or "").strip()
+    try:
+        parsed = parse_telegram_url(text)
+    except Exception:
+        await update.effective_message.reply_text("Please send a valid private message link (https://t.me/c/123456789/45)")
+        return PRIVATE_MESSAGE
+
+    if parsed.get("type") != "private_message":
+        await update.effective_message.reply_text("Please send a valid private message link (https://t.me/c/123456789/45)")
+        return PRIVATE_MESSAGE
+
+    flow = flow_state(context)
+    flow["targets"] = [text]
+    flow["target_kind"] = "private"
+
+    await update.effective_message.reply_text("Send a brief reason for reporting (up to 5 lines).")
+    return REPORT_REASON_TYPE
+
+
+async def handle_public_message_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = (update.message.text or "").strip()
+    if not is_valid_link(text):
+        await update.effective_message.reply_text("Send a valid public message link (https://t.me/username/1234)")
+        return PUBLIC_MESSAGE
+
+    flow = flow_state(context)
+    flow["targets"] = [text]
+    flow["target_kind"] = "public"
+
+    await update.effective_message.reply_text("Send a brief reason for reporting (up to 5 lines).")
+    return REPORT_REASON_TYPE
+
+
+async def handle_story_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = (update.message.text or "").strip()
+    if not is_valid_link(text):
+        await update.effective_message.reply_text("Send a valid story URL or username.")
+        return STORY_URL
+
+    flow = flow_state(context)
+    flow["targets"] = [text]
+    flow["target_kind"] = "story"
+
+    await update.effective_message.reply_text("Send a brief reason for reporting (up to 5 lines).")
+    return REPORT_REASON_TYPE
+
+
+async def handle_report_urls(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    targets = parse_links(update.message.text or "")
+    if not targets:
+        await update.effective_message.reply_text("Please send at least one valid Telegram URL.")
+        return REPORT_URLS
+
+    flow_state(context)["targets"] = targets
+    await update.effective_message.reply_text(
+        "Select a report type.", reply_markup=reason_keyboard()
+    )
+    return REPORT_REASON_TYPE
+
+
+async def handle_reason_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    reason_code = int(query.data.split(":")[1])
+    flow_state(context)["reason_code"] = reason_code
+
+    await query.edit_message_text("Send a short reason for reporting (up to 5 lines).")
+    return REPORT_MESSAGE
+
+
+async def handle_reason_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    reasons = parse_reasons(update.message.text or "")
+    if not reasons:
+        await update.effective_message.reply_text("Please send at least one reason.")
+        return REPORT_MESSAGE
+
+    flow_state(context)["reasons"] = reasons
+    await update.effective_message.reply_text(
+        f"How many report requests? (min {MIN_REPORTS}, max {MAX_REPORTS}, or 'default' for {DEFAULT_REPORTS})"
+    )
+    return REPORT_COUNT
+
+
+async def handle_report_count(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = (update.message.text or "").strip().lower()
+    if text in {"", "default"}:
+        count = DEFAULT_REPORTS
+    elif text.isdigit():
+        count = int(text)
+        if not (MIN_REPORTS <= count <= MAX_REPORTS):
+            await update.effective_message.reply_text(
+                friendly_error(f"Enter a number between {MIN_REPORTS} and {MAX_REPORTS}, or 'default'.")
+            )
+            return REPORT_COUNT
+    else:
+        await update.effective_message.reply_text(
+            friendly_error(f"Enter a number between {MIN_REPORTS} and {MAX_REPORTS}, or 'default'.")
+        )
+        return REPORT_COUNT
+
+    flow_state(context)["count"] = count
+
+    flow = flow_state(context)
+    summary = (
+        f"Targets: {len(flow.get('targets', []))}\n"
+        f"Reasons: {', '.join(flow.get('reasons', []))}\n"
+        f"Report type: {flow.get('reason_code')}\n"
+        f"Total reports each: {flow.get('count')}\n"
+        f"Session count: {len(flow.get('sessions', []))}"
+    )
+
+    await update.effective_message.reply_text(
+        f"Confirm the report run?\n\n{summary}",
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("Start", callback_data="confirm:start")],
+                [InlineKeyboardButton("Cancel", callback_data="confirm:cancel")],
+            ]
+        ),
+    )
+    return ConversationHandler.WAITING
+
+
+async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    if query.data == "confirm:cancel":
+        await query.edit_message_text("Canceled. Use /report to start over.")
+        return ConversationHandler.END
+
+    await query.edit_message_text("Reporting has started. I'll send updates when done.")
+
+    job_data = deepcopy(flow_state(context))
+
+    context.application.create_task(run_report_job(query, context, job_data))
+    return ConversationHandler.END
+
+
+async def handle_add_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.effective_message.reply_text(
+        f"Send between {MIN_SESSIONS} and {MAX_SESSIONS} Pyrogram session strings (one per line)."
+    )
+    return ADD_SESSIONS
+
+
+async def receive_added_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    sessions = session_strings_from_text(update.message.text or "")
+    if not (MIN_SESSIONS <= len(sessions) <= MAX_SESSIONS):
+        await update.effective_message.reply_text(
+            friendly_error(f"Please provide between {MIN_SESSIONS} and {MAX_SESSIONS} sessions.")
+        )
+        return ADD_SESSIONS
+
+    added = await data_store.add_sessions(
+        sessions, added_by=update.effective_user.id if update.effective_user else None
+    )
+    profile_state(context)["saved_sessions"] = (profile_state(context).get("saved_sessions") or []) + added
+    await update.effective_message.reply_text(
+        f"Stored {len(added)} new session(s). Total available: {len(await data_store.get_sessions())}."
+    )
+    return ConversationHandler.END
+
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.effective_message.reply_text("Canceled. Use /report to begin again.")
+    reset_flow_state(context)
+    return ConversationHandler.END
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logging.exception("Update %s caused error", update, exc_info=context.error)
+    if isinstance(update, Update) and update.effective_message:
+        await update.effective_message.reply_text("Something went wrong. Please try again later.")
+
+
+__all__ = [
+    "start",
+    "help_command",
+    "show_sessions",
+    "handle_action_buttons",
+    "handle_status_chip",
+    "handle_session_mode",
+    "start_report",
+    "handle_api_id",
+    "handle_api_hash",
+    "handle_sessions",
+    "handle_target_kind",
+    "handle_private_invite",
+    "handle_private_message_link",
+    "handle_public_message_link",
+    "handle_story_url",
+    "handle_report_urls",
+    "handle_reason_type",
+    "handle_reason_message",
+    "handle_report_count",
+    "handle_confirmation",
+    "handle_add_sessions",
+    "receive_added_sessions",
+    "cancel",
+    "error_handler",
+]

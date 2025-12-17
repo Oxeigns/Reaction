@@ -254,6 +254,43 @@ async def handle_action_buttons(update: Update, context: ContextTypes.DEFAULT_TY
     return ConversationHandler.END
 
 
+async def handle_report_again(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    last_config = context.user_data.get("last_report_config") or {}
+    profile = profile_state(context)
+    profile["saved_sessions"] = await data_store.get_sessions()
+
+    if not last_config.get("sessions") and not profile.get("saved_sessions"):
+        await safe_edit_message(
+            query,
+            friendly_error("No previous sessions available. Please add sessions to start reporting."),
+            reply_markup=main_menu_keyboard(saved_session_count(context), active_session_count(context)),
+        )
+        return ConversationHandler.END
+
+    flow = reset_flow_state(context)
+    flow["sessions"] = list(last_config.get("sessions") or profile.get("saved_sessions") or [])
+
+    if last_config.get("api_id"):
+        flow["api_id"] = last_config["api_id"]
+    elif profile.get("api_id"):
+        flow["api_id"] = profile["api_id"]
+
+    if last_config.get("api_hash"):
+        flow["api_hash"] = last_config["api_hash"]
+    elif profile.get("api_hash"):
+        flow["api_hash"] = profile["api_hash"]
+
+    await safe_edit_message(
+        query,
+        "Reusing your previous sessions. What are you reporting?",
+        reply_markup=target_kind_keyboard(),
+    )
+    return TARGET_KIND
+
+
 async def handle_status_chip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer("Live status indicators — you are already in the dark UI.", show_alert=False)
@@ -575,6 +612,8 @@ async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     job_data = deepcopy(flow_state(context))
 
+    context.user_data["last_report_config"] = deepcopy(job_data)
+
     task = context.application.create_task(run_report_job(query, context, job_data))
     context.user_data["active_report_task"] = task
     clear_report_state(context)
@@ -630,6 +669,7 @@ __all__ = [
     "handle_action_buttons",
     "handle_status_chip",
     "handle_session_mode",
+    "handle_report_again",
     "start_report",
     "handle_api_id",
     "handle_api_hash",

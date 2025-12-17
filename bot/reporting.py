@@ -13,7 +13,7 @@ from telegram.ext import ContextTypes
 from bot.constants import DEFAULT_REPORTS
 from bot.dependencies import API_HASH, API_ID, data_store, ensure_pyrogram_creds
 from bot.state import reset_user_context
-from bot.ui import add_restart_button, render_card
+from bot.ui import render_card, report_again_keyboard
 from bot.utils import resolve_chat_id, validate_sessions
 from report import report_profile_photo
 
@@ -120,7 +120,7 @@ async def run_report_job(query, context: ContextTypes.DEFAULT_TYPE, job_data: di
             chat_id=chat_id,
             text=f"<pre>{card}</pre>",
             parse_mode=ParseMode.HTML,
-            reply_markup=add_restart_button(None),
+            reply_markup=report_again_keyboard(),
         )
         reset_user_context(context, user.id if user else None)
         return
@@ -149,7 +149,7 @@ async def run_report_job(query, context: ContextTypes.DEFAULT_TYPE, job_data: di
         chat_id=chat_id,
         text=f"<pre>{card}</pre>",
         parse_mode=ParseMode.HTML,
-        reply_markup=add_restart_button(None),
+        reply_markup=report_again_keyboard(),
     )
 
     reset_user_context(context, user.id if user else None)

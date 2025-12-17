@@ -46,6 +46,12 @@ def add_restart_button(markup: InlineKeyboardMarkup | None) -> InlineKeyboardMar
     return _with_restart_row(markup.inline_keyboard)
 
 
+def report_again_keyboard() -> InlineKeyboardMarkup:
+    return add_restart_button(
+        InlineKeyboardMarkup([[InlineKeyboardButton("🔁 Report again", callback_data="report_again")]])
+    )
+
+
 def main_menu_keyboard(saved_sessions: int = 0, active_sessions: int = 0, live_status: str = MENU_LIVE_STATUS) -> InlineKeyboardMarkup:
     return _with_restart_row(
         [
@@ -124,6 +130,7 @@ __all__ = [
     "render_greeting",
     "render_card",
     "add_restart_button",
+    "report_again_keyboard",
 ]
 
 

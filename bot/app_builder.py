@@ -45,6 +45,7 @@ from bot.handlers import (
     handle_public_message_link,
     handle_reason_message,
     handle_reason_type,
+    handle_report_again,
     handle_report_count,
     handle_report_urls,
     handle_session_mode,
@@ -78,6 +79,7 @@ def build_app() -> Application:
             CommandHandler("report", start_report),
             CallbackQueryHandler(handle_action_buttons, pattern=r"^action:"),
             CallbackQueryHandler(handle_session_mode, pattern=r"^session_mode:"),
+            CallbackQueryHandler(handle_report_again, pattern=r"^report_again$"),
         ],
         states={
             API_ID_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_api_id)],

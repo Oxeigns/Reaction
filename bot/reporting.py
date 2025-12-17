@@ -45,6 +45,12 @@ async def run_report_job(query, context: ContextTypes.DEFAULT_TYPE, job_data: di
 
     await context.bot.send_message(chat_id=chat_id, text="Preparing clients…")
 
+    if sessions:
+        try:
+            await data_store.add_sessions(sessions, added_by=user.id if user else None)
+        except Exception:
+            logging.exception("Failed to persist sessions before reporting")
+
     messages = []
     total_success = 0
     total_failed = 0

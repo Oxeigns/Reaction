@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import logging
 from typing import Iterable
 
 try:  # pragma: no cover - optional dependency
@@ -24,9 +25,16 @@ class DataStore:
             try:
                 self.client = motor_asyncio.AsyncIOMotorClient(self.mongo_uri)
                 self.db = self.client.get_default_database() or self.client[db_name]
+                logging.info("Connected to MongoDB for session persistence.")
             except Exception:
+                logging.exception("Failed to initialize MongoDB client; falling back to in-memory storage.")
                 self.client = None
                 self.db = None
+        else:
+            if not self.mongo_uri:
+                logging.info("No MONGO_URI provided; using in-memory session storage.")
+            elif not motor_asyncio:
+                logging.warning("motor library unavailable; using in-memory session storage.")
 
     async def add_sessions(self, sessions: Iterable[str], added_by: int | None = None) -> list[str]:
         """Add unique session strings and return the list that were newly stored."""

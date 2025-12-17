@@ -67,6 +67,17 @@ from bot.utils import (
     validate_sessions,
 )
 
+HELP_MESSAGE = (
+    "ℹ️ *How to use the reporter*\n"
+    "1) Run /report or tap Start report.\n"
+    "2) Provide your API ID and API Hash.\n"
+    "3) Add 1-500 Pyrogram session strings (or type 'use saved').\n"
+    "4) Pick what you are reporting (private group, public group/channel, or profile/story).\n"
+    "5) Send up to 5 Telegram URLs, choose a report type, and write a short reason.\n"
+    "6) Choose 500-7000 report attempts (default 5000).\n"
+    "I will show successes, failures, time taken, and stop automatically if the content disappears."
+)
+
 
 async def safe_edit_message(query, text: str, *, reply_markup=None, parse_mode=None, **kwargs):
     current = query.message
@@ -197,17 +208,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = (
-        "ℹ️ *How to use the reporter*\n"
-        "1) Run /report or tap Start report.\n"
-        "2) Provide your API ID and API Hash.\n"
-        "3) Add 1-500 Pyrogram session strings (or type 'use saved').\n"
-        "4) Pick what you are reporting (private group, public group/channel, or profile/story).\n"
-        "5) Send up to 5 Telegram URLs, choose a report type, and write a short reason.\n"
-        "6) Choose 500-7000 report attempts (default 5000).\n"
-        "I will show successes, failures, time taken, and stop automatically if the content disappears."
-    )
-    await update.effective_message.reply_text(message, parse_mode=ParseMode.MARKDOWN)
+    await update.effective_message.reply_text(HELP_MESSAGE, parse_mode=ParseMode.MARKDOWN)
 
 async def _notify_user(
     update: Update,
@@ -327,10 +328,19 @@ async def handle_action_buttons(update: Update, context: ContextTypes.DEFAULT_TY
     if query.data == "action:add":
         await safe_edit_message(query, f"Send {MIN_SESSIONS}-{MAX_SESSIONS} Pyrogram session strings, one per line.")
         return ADD_SESSIONS
+    if query.data == "action:help":
+        await safe_edit_message(
+            query,
+            HELP_MESSAGE,
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=main_menu_keyboard(saved_session_count(context), active_session_count(context)),
+        )
+        return ConversationHandler.END
     if query.data == "action:sessions":
         saved = len(await data_store.get_sessions())
         active = active_session_count(context)
         await safe_edit_message(
+            query,
             f"Saved sessions: {saved}\nCurrently loaded for this chat: {active}",
             reply_markup=main_menu_keyboard(saved, active),
         )
@@ -427,6 +437,7 @@ async def handle_session_mode(update: Update, context: ContextTypes.DEFAULT_TYPE
             return ConversationHandler.END
 
         flow["sessions"] = valid_sessions
+        profile["saved_sessions"] = list(valid_sessions)
         session_preview = _format_sessions_for_copy(valid_sessions)
         await safe_edit_message(
             query,
@@ -554,6 +565,12 @@ async def handle_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if not valid_sessions:
         return REPORT_SESSIONS
+
+    added = await data_store.add_sessions(
+        valid_sessions, added_by=update.effective_user.id if update.effective_user else None
+    )
+    if added:
+        profile["saved_sessions"] = list({*(profile.get("saved_sessions") or []), *valid_sessions})
 
     flow["sessions"] = valid_sessions
     await update.effective_message.reply_text("What are you reporting?", reply_markup=target_kind_keyboard())

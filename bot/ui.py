@@ -99,6 +99,7 @@ def main_menu_keyboard(
                 InlineKeyboardButton("➕ Add Sessions", callback_data="action:add"),
                 InlineKeyboardButton("💾 Saved Sessions", callback_data="action:sessions"),
             ],
+            [InlineKeyboardButton("ℹ️ Help", callback_data="action:help")],
             [
                 InlineKeyboardButton(f"🟢 Status: {live_status}", callback_data="status:live"),
                 InlineKeyboardButton(f"🎯 Loaded: {active_sessions}", callback_data="status:active"),
@@ -147,12 +148,12 @@ def session_mode_keyboard() -> InlineKeyboardMarkup:
 
 def render_greeting() -> str:
     return render_card(
-        "Nightfall Reporter",
+        "Team Destroyer Reporting · Oxygen",
         [
-            "Welcome to Nightfall Reporter.",
-            "Start with saved sessions, or add new sessions anytime.",
-            "Use the status chips to track readiness and loaded/saved sessions.",
-            "Choose an action below to continue.",
+            "Welcome to Team Destroyer — reporting made by Oxygen.",
+            "Sessions you add are saved for reuse, even after restarts.",
+            "Use the panel buttons for quick help, adding sessions, or starting a report.",
+            "Status chips track readiness plus loaded and saved sessions.",
         ],
         [],
     )

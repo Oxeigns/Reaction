@@ -97,7 +97,7 @@ def build_app() -> Application:
         },
         fallbacks=[CommandHandler("cancel", cancel)],
         allow_reentry=True,
-        per_message=True,
+        per_message=False,
         per_chat=True,
         per_user=True,
     )
@@ -107,7 +107,7 @@ def build_app() -> Application:
         states={ADD_SESSIONS: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_added_sessions)]},
         fallbacks=[CommandHandler("cancel", cancel)],
         allow_reentry=True,
-        per_message=True,
+        per_message=False,
         per_chat=True,
         per_user=True,
     )

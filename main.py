@@ -16,6 +16,11 @@ from datetime import datetime, timezone
 from typing import Iterable, List
 from urllib.parse import urlparse
 
+# Python 3.12+ does not create an implicit event loop for the main thread.
+# Pyrogram's sync wrapper tries to grab the current loop during import, so we
+# pre-create one to avoid a RuntimeError on startup.
+asyncio.set_event_loop(asyncio.new_event_loop())
+
 from pyrogram import Client
 from pyrogram.errors import BadRequest, FloodWait, RPCError, UsernameNotOccupied
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update

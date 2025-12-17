@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 from urllib.parse import urlparse
 
+from pyrogram.errors import PeerIdInvalid, UsernameInvalid, UsernameNotOccupied
+
 from pyrogram import Client
 
 from bot.dependencies import API_HASH, API_ID
@@ -68,6 +70,37 @@ def parse_telegram_url(url: str) -> dict:
     raise ValueError("Unrecognized Telegram URL format")
 
 
+def normalize_target(target: str) -> tuple[str, dict]:
+    """Normalize user-supplied target strings to a consistent username/id form.
+
+    The function accepts plain usernames, ``@username`` mentions, ``t.me`` links,
+    HTTPS ``t.me`` links, and numeric IDs. It returns the normalized identifier
+    along with the parsed details so callers can decide how to resolve it.
+    """
+
+    raw = target.strip()
+
+    if raw.startswith("@"):
+        raw = raw[1:]
+
+    if raw.lstrip("-").isdigit():
+        return raw, {"type": "numeric_id", "id": int(raw)}
+
+    if "t.me" in raw or raw.startswith("http"):
+        try:
+            details = parse_telegram_url(raw)
+            normalized = details.get("username") or details.get("chat_id") or details.get("invite_link")
+            return str(normalized), details
+        except Exception:
+            # Fall back to treating the path segment as a username
+            parsed = urlparse(raw if raw.startswith("http") else f"https://{raw}")
+            path = parsed.path.lstrip("/")
+            if path:
+                return path.split("/", maxsplit=1)[0], {"type": "username", "username": path}
+
+    return raw, {"type": "username", "username": raw}
+
+
 def extract_target_identifier(text: str) -> str:
     text = text.strip()
     if text.startswith("@"):  # username
@@ -105,39 +138,86 @@ async def validate_sessions(api_id: int, api_hash: str, sessions: list[str]) -> 
 
 
 async def resolve_chat_id(client: Client, target: str, invite_link: str | None = None):
-    details = parse_telegram_url(target)
+    """Backward-compatible wrapper returning only the chat ID."""
 
-    if details["type"] == "invite":
-        chat = await client.get_chat(details["invite_link"])
-        return chat.id
+    peer, _ = await resolve_target_peer(client, target, invite_link)
 
-    if details["type"] == "private_message":
-        chat_id = details["chat_id"]
+    if hasattr(peer, "user_id"):
+        return int(getattr(peer, "user_id"))
+    if hasattr(peer, "channel_id"):
+        # Pyrogram prepends -100 to channel IDs for chat ids
+        return int(f"-100{getattr(peer, 'channel_id')}")
+    if hasattr(peer, "chat_id"):
+        return int(getattr(peer, "chat_id"))
 
-        if invite_link:
-            chat = await client.join_chat(invite_link)
-            chat_id = getattr(chat, "id", chat_id)
-        else:
-            chat = await client.get_chat(chat_id)
-            chat_id = getattr(chat, "id", chat_id)
+    return int(peer)
 
-        await client.get_messages(chat_id, details["message_id"])
-        return chat_id
 
-    if details["type"] == "public_message":
-        chat = await client.get_chat(details["username"])
-        await client.get_messages(chat.id, details["message_id"])
-        return chat.id
+async def _refresh_dialogs(client: Client) -> None:
+    """Refresh dialog list once per client to improve peer resolution."""
 
-    if details["type"] == "story":
-        chat = await client.get_chat(details["username"])
-        return chat.id
+    if getattr(client, "_dialogs_refreshed", False):
+        return
 
-    if details["type"] == "username":
-        chat = await client.get_chat(details["username"])
-        return chat.id
+    try:
+        await client.get_dialogs()
+    finally:
+        client._dialogs_refreshed = True
 
-    raise ValueError("Unsupported Telegram link format")
+
+async def resolve_target_peer(client: Client, target: str, invite_link: str | None = None):
+    """Resolve a user-supplied target into an InputPeer/User/Peer object.
+
+    The helper normalizes common Telegram formats (``@username``, ``t.me`` links,
+    numeric IDs, and message links) and retries once after refreshing dialogs.
+    It raises a ``PeerIdInvalid``/``UsernameNotOccupied``/``UsernameInvalid``
+    when resolution is impossible so callers can surface a friendly message.
+    """
+
+    normalized, details = normalize_target(target)
+    attempts = 0
+    last_exc: Exception | None = None
+
+    while attempts < 2:
+        attempts += 1
+        try:
+            await _refresh_dialogs(client)
+
+            if details.get("type") == "invite":
+                chat = await client.get_chat(details["invite_link"])
+                resolved = await client.resolve_peer(chat.id)
+                return resolved, normalized
+
+            if details.get("type") in {"public_message", "private_message"}:
+                chat = await client.get_chat(details.get("username") or details.get("chat_id"))
+                await client.get_messages(chat.id, details.get("message_id"))
+                resolved = await client.resolve_peer(chat.id)
+                return resolved, normalized
+
+            if details.get("type") == "story":
+                chat = await client.get_chat(details["username"])
+                resolved = await client.resolve_peer(chat.id)
+                return resolved, normalized
+
+            if details.get("type") == "numeric_id":
+                resolved = await client.resolve_peer(details["id"])
+                return resolved, normalized
+
+            resolved = await client.resolve_peer(details.get("username") or normalized)
+            return resolved, normalized
+
+        except (PeerIdInvalid, UsernameNotOccupied, UsernameInvalid) as exc:
+            last_exc = exc
+            if attempts >= 2:
+                raise
+            # Retry after clearing dialog cache once
+            client._dialogs_refreshed = False
+            continue
+
+    if last_exc:
+        raise last_exc
+
+    raise PeerIdInvalid("Unable to resolve target")
 
 
 async def validate_targets(
@@ -195,9 +275,11 @@ __all__ = [
     "parse_links",
     "is_valid_link",
     "parse_telegram_url",
+    "normalize_target",
     "extract_target_identifier",
     "session_strings_from_text",
     "validate_sessions",
+    "resolve_target_peer",
     "resolve_chat_id",
     "validate_targets",
 ]

@@ -14,7 +14,7 @@ from bot.constants import DEFAULT_REPORTS
 from bot.dependencies import API_HASH, API_ID, data_store, ensure_pyrogram_creds
 from bot.state import reset_user_context
 from bot.ui import render_card, report_again_keyboard
-from bot.utils import resolve_chat_id, validate_sessions
+from bot.utils import normalize_target, resolve_target_peer, validate_sessions
 from report import report_profile_photo
 
 if TYPE_CHECKING:
@@ -24,7 +24,15 @@ if TYPE_CHECKING:
     # when no loop exists yet. Delaying the import until we are already inside a
     # running event loop keeps startup stable on Heroku.
     from pyrogram.client import Client
-    from pyrogram.errors import BadRequest, FloodWait, RPCError, UsernameNotOccupied, UserDeactivated
+    from pyrogram.errors import (
+        BadRequest,
+        FloodWait,
+        PeerIdInvalid,
+        RPCError,
+        UsernameInvalid,
+        UsernameNotOccupied,
+        UserDeactivated,
+    )
 
 
 def _session_label(session: str) -> str:
@@ -236,33 +244,57 @@ async def perform_reporting(
 
     try:
         chat_id: int | None = None
+        normalized_target: str | None = normalize_target(target)[0]
         last_error: str | None = None
 
         for client in clients:
             try:
-                chat_id = await resolve_chat_id(client, target, invite_link)
+                peer, normalized = await resolve_target_peer(client, target, invite_link)
+                normalized_target = normalized
+                chat_id = peer
                 break
-            except UsernameNotOccupied:
-                logging.warning("Username not occupied while resolving '%s' via %s", target, client.name)
+            except (PeerIdInvalid, UsernameInvalid, UsernameNotOccupied) as exc:
+                logging.warning(
+                    "Peer resolution failed for '%s' (normalized '%s') via %s: %s",
+                    target,
+                    normalized_target or target,
+                    client.name,
+                    exc.__class__.__name__,
+                )
                 last_error = (
-                    "The username or link appears to be unoccupied or deleted. "
-                    "Please verify the target and try again."
+                    "Cannot report this user yet. Ask the user to send/forward a message "
+                    "from that account to the bot/client or interact once so Telegram knows the peer."
                 )
                 continue
             except BadRequest as exc:
-                logging.warning("Bad request resolving '%s' via %s: %s", target, client.name, exc)
+                logging.warning(
+                    "Bad request resolving '%s' (normalized '%s') via %s: %s",
+                    target,
+                    normalized_target or target,
+                    client.name,
+                    exc.__class__.__name__,
+                )
                 last_error = f"The link '{target}' is not valid: {exc}."
                 break
             except RPCError as exc:
-                logging.warning("RPC error resolving '%s' via %s: %s", target, client.name, exc)
-                last_error = f"Could not resolve '{target}' ({exc})."
+                logging.warning(
+                    "RPC error resolving '%s' (normalized '%s') via %s: %s",
+                    target,
+                    normalized_target or target,
+                    client.name,
+                    exc.__class__.__name__,
+                )
+                last_error = (
+                    "Cannot report this user yet. Ask the user to send/forward a message from that "
+                    "account to the bot/client or interact once so Telegram knows the peer."
+                )
                 continue
 
         if chat_id is None:
             return {
                 "success": 0,
                 "failed": 0,
-                "halted": True,
+                "halted": False,
                 "error": last_error or "Unable to resolve the target with the available sessions.",
             }
 
@@ -308,9 +340,23 @@ async def perform_reporting(
                         _session_label(session_string),
                     )
                 return False
+            except (PeerIdInvalid, UsernameInvalid, UsernameNotOccupied) as exc:
+                logging.error(
+                    "Peer not resolvable while reporting %s (normalized %s) via %s: %s",
+                    target,
+                    normalized_target,
+                    client.name,
+                    exc.__class__.__name__,
+                )
+                return False
             except (BadRequest, RPCError) as exc:
                 halted = True
-                logging.error("Halting report run due to RPC/BadRequest error for %s via %s: %s", target, client.name, exc)
+                logging.error(
+                    "Halting report run due to RPC/BadRequest error for %s via %s: %s",
+                    target,
+                    client.name,
+                    exc,
+                )
                 return False
 
         worker_count = max(1, min(max_concurrency, total, len(clients)))

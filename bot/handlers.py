@@ -322,10 +322,11 @@ async def handle_private_message_link(update: Update, context: ContextTypes.DEFA
     flow = flow_state(context)
     flow["targets"] = [text]
     flow["target_kind"] = "private"
-    flow.setdefault("reason_code", 5)
 
-    await update.effective_message.reply_text("Send a brief reason for reporting (up to 5 lines).")
-    return REPORT_MESSAGE
+    await update.effective_message.reply_text(
+        "Select a report type.", reply_markup=reason_keyboard()
+    )
+    return REPORT_REASON_TYPE
 
 
 async def handle_public_message_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -337,10 +338,11 @@ async def handle_public_message_link(update: Update, context: ContextTypes.DEFAU
     flow = flow_state(context)
     flow["targets"] = [text]
     flow["target_kind"] = "public"
-    flow.setdefault("reason_code", 5)
 
-    await update.effective_message.reply_text("Send a brief reason for reporting (up to 5 lines).")
-    return REPORT_MESSAGE
+    await update.effective_message.reply_text(
+        "Select a report type.", reply_markup=reason_keyboard()
+    )
+    return REPORT_REASON_TYPE
 
 
 async def handle_story_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -352,10 +354,11 @@ async def handle_story_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     flow = flow_state(context)
     flow["targets"] = [text]
     flow["target_kind"] = "story"
-    flow.setdefault("reason_code", 5)
 
-    await update.effective_message.reply_text("Send a brief reason for reporting (up to 5 lines).")
-    return REPORT_MESSAGE
+    await update.effective_message.reply_text(
+        "Select a report type.", reply_markup=reason_keyboard()
+    )
+    return REPORT_REASON_TYPE
 
 
 async def handle_report_urls(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:

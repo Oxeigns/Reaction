@@ -39,12 +39,12 @@ async def main_async() -> None:
     verify_author_integrity(config.AUTHOR_NAME, config.AUTHOR_HASH)
     build_logger()
 
-    SchedulerManager.ensure_job("heartbeat", log_heartbeat, trigger="interval", seconds=300)
-
     app = build_app()
     shutdown_event = asyncio.Event()
 
     loop = asyncio.get_running_loop()
+    SchedulerManager.set_event_loop(loop)
+    SchedulerManager.ensure_job("heartbeat", log_heartbeat, trigger="interval", seconds=300)
     _setup_signal_handlers(loop, shutdown_event)
 
     try:

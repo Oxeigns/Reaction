@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Awaitable, Callable
 
@@ -10,11 +11,24 @@ class SchedulerManager:
     """Wrapper to ensure the APScheduler instance starts only once."""
 
     _scheduler: AsyncIOScheduler | None = None
+    _event_loop: asyncio.AbstractEventLoop | None = None
+
+    @classmethod
+    def set_event_loop(cls, loop: asyncio.AbstractEventLoop) -> None:
+        """Record the running loop so job threads don't rely on get_event_loop.
+
+        Python 3.10+ no longer installs a default loop on every thread, so
+        AsyncIOScheduler must be bound explicitly to the loop created by
+        ``asyncio.run`` instead of calling ``asyncio.get_event_loop`` later.
+        """
+
+        cls._event_loop = loop
 
     @classmethod
     def get_scheduler(cls) -> AsyncIOScheduler:
         if cls._scheduler is None:
-            cls._scheduler = AsyncIOScheduler()
+            loop = cls._event_loop or asyncio.get_running_loop()
+            cls._scheduler = AsyncIOScheduler(event_loop=loop)
         return cls._scheduler
 
     @classmethod

@@ -2,7 +2,7 @@
   "name": "Reaction Reporter Bot",
   "description": "Telegram reporting bot using Pyrogram with multi-session support and guided inline UI.",
   "keywords": ["telegram", "bot", "pyrogram", "report", "heroku"],
-  "repository": "https://github.com/<your-username>/Reaction",
+  "repository": "https://github.com/Oxeigns/Reaction",
   "env": {
     "BOT_TOKEN": {
       "description": "Telegram bot token from @BotFather.",

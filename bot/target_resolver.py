@@ -53,6 +53,16 @@ class TargetDetails:
     username: str | None
     members: int | None
     private: bool
+    is_channel: bool = False
+    is_group: bool = False
+    is_user: bool = False
+    is_verified: bool = False
+    is_scam: bool = False
+    is_fake: bool = False
+    is_bot: bool = False
+    restrictions: str | None = None
+    bio: str | None = None
+    description: str | None = None
 
 
 _CACHE: dict[str, tuple[ResolvedTarget, datetime]] = {}
@@ -264,12 +274,19 @@ def _chat_id_from_chat(chat: Any) -> int:
 
 async def fetch_target_details(client: Any, resolved: ResolvedTarget) -> TargetDetails:
     if not resolved.ok or not resolved.peer:
-        return TargetDetails(type=None, title=None, id=None, username=None, members=None, private=False)
+        return TargetDetails(
+            type=None,
+            title=None,
+            id=None,
+            username=None,
+            members=None,
+            private=False,
+        )
 
     chat = resolved.peer
     chat_id = _chat_id_from_chat(chat)
 
-    # Refresh chat info to capture member counts when possible
+    # Refresh chat info to capture member counts and flags when possible
     try:
         chat = await client.get_chat(chat_id)
     except Exception:
@@ -278,17 +295,97 @@ async def fetch_target_details(client: Any, resolved: ResolvedTarget) -> TargetD
     peer_type = getattr(chat, "type", None)
     title = getattr(chat, "title", None) or getattr(chat, "first_name", None)
     username = getattr(chat, "username", None)
-    members = getattr(chat, "members_count", None)
+    members = getattr(chat, "members_count", None) or getattr(chat, "participants_count", None)
     private = bool(getattr(chat, "is_private", False) or (username is None))
 
+    type_label = str(peer_type) if peer_type else None
+    is_channel = type_label is not None and "channel" in type_label
+    is_group = type_label is not None and "group" in type_label
+    is_user = type_label is not None and "user" in type_label
+
     return TargetDetails(
-        type=str(peer_type) if peer_type else None,
+        type=type_label,
         title=title,
         id=chat_id,
         username=username,
         members=members,
         private=private,
+        is_channel=is_channel,
+        is_group=is_group,
+        is_user=is_user,
+        is_verified=bool(getattr(chat, "is_verified", False)),
+        is_scam=bool(getattr(chat, "is_scam", False)),
+        is_fake=bool(getattr(chat, "is_fake", False)),
+        is_bot=bool(getattr(chat, "is_bot", False)),
+        restrictions="; ".join(getattr(chat, "restriction_reason", []) or []) or None,
+        bio=getattr(chat, "bio", None),
+        description=getattr(chat, "description", None),
     )
+
+
+def format_target_details(details: TargetDetails) -> str:
+    """Render a user-friendly detail string for chats or users."""
+
+    if details.is_user or details.type == "user":
+        lines = ["👤 Profile details:"]
+        lines.append(f"• Name: {details.title or 'Unknown'}")
+        lines.append(f"• Username: @{details.username}" if details.username else "• Username: None")
+        lines.append(f"• User ID: {details.id}")
+        if details.bio:
+            lines.append(f"• Bio: {details.bio}")
+        flags = [
+            flag
+            for flag, enabled in {
+                "Bot": details.is_bot,
+                "Verified": details.is_verified,
+                "Scam": details.is_scam,
+                "Fake": details.is_fake,
+            }.items()
+            if enabled
+        ]
+        if flags:
+            lines.append(f"• Flags: {', '.join(flags)}")
+        return "\n".join(lines)
+
+    lines = ["🗂 Chat details:"]
+    lines.append(f"• Title: {details.title or 'Unknown'}")
+    lines.append(f"• Username: @{details.username}" if details.username else "• Username: None")
+    lines.append(f"• Chat ID: {details.id}")
+
+    type_bits: list[str] = []
+    if details.is_channel:
+        type_bits.append("channel")
+    if details.is_group:
+        type_bits.append("group")
+    if details.private:
+        type_bits.append("private")
+    else:
+        type_bits.append("public")
+    if not type_bits and details.type:
+        type_bits.append(details.type)
+    if type_bits:
+        lines.append(f"• Type: {' / '.join(type_bits)}")
+
+    if details.members is not None:
+        label = "Subscribers" if details.is_channel and not details.is_group else "Members"
+        lines.append(f"• {label}: {details.members}")
+
+    if details.description:
+        lines.append(f"• About: {details.description}")
+    if details.restrictions:
+        lines.append(f"• Restrictions: {details.restrictions}")
+    flags = [
+        flag
+        for flag, enabled in {
+            "Verified": details.is_verified,
+            "Scam": details.is_scam,
+            "Fake": details.is_fake,
+        }.items()
+        if enabled
+    ]
+    if flags:
+        lines.append(f"• Flags: {', '.join(flags)}")
+    return "\n".join(lines)
 
 
 def _purge_cache() -> None:
@@ -346,5 +443,6 @@ __all__ = [
     "ensure_join_if_needed",
     "resolve_peer",
     "fetch_target_details",
+    "format_target_details",
     "debug_resolve_targets",
 ]

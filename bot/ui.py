@@ -115,6 +115,7 @@ def target_kind_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton("🔒 Private Channel / Group", callback_data="kind:private")],
             [InlineKeyboardButton("🌐 Public Channel / Group", callback_data="kind:public")],
             [InlineKeyboardButton("📎 Story URL (Profile)", callback_data="kind:story")],
+            [InlineKeyboardButton("✖️ Cancel", callback_data="nav:cancel")],
         ]
     )
 
@@ -133,6 +134,10 @@ def reason_keyboard() -> InlineKeyboardMarkup:
         buttons[2:4],
         buttons[4:6],
         buttons[6:7],
+        [
+            InlineKeyboardButton("⬅️ Back", callback_data="nav:back:target_kind"),
+            InlineKeyboardButton("✖️ Cancel", callback_data="nav:cancel"),
+        ],
     ]
     return _with_restart_row(rows)
 
@@ -144,6 +149,15 @@ def session_mode_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton("Add New Sessions", callback_data="session_mode:new")],
         ]
     )
+
+
+def navigation_keyboard(back_to: str | None = None, *, include_cancel: bool = True) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if back_to:
+        rows.append([InlineKeyboardButton("⬅️ Back", callback_data=f"nav:back:{back_to}")])
+    if include_cancel:
+        rows.append([InlineKeyboardButton("✖️ Cancel", callback_data="nav:cancel")])
+    return _with_restart_row(rows)
 
 
 def render_greeting() -> str:
@@ -168,4 +182,5 @@ __all__ = [
     "render_card",
     "add_restart_button",
     "report_again_keyboard",
+    "navigation_keyboard",
 ]

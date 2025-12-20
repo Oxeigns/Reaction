@@ -160,7 +160,8 @@ async def _refresh_dialogs(client: Client) -> None:
         return
 
     try:
-        await client.get_dialogs()
+        async for _ in client.get_dialogs():
+            pass
     finally:
         client._dialogs_refreshed = True
 

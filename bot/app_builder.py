@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import contextlib
 
-from telegram.error import NetworkError
+import httpx
+from telegram.error import NetworkError, TimedOut
 from telegram.ext import (
     AIORateLimiter,
     Application,
@@ -14,6 +16,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+from telegram.request import HTTPXRequest
 
 from bot.constants import (
     ADD_SESSIONS,
@@ -64,13 +67,26 @@ from bot.handlers import (
     uptime_command,
 )
 
+DEFAULT_POLL_TIMEOUT = 30  # Keep getUpdates sockets alive longer to avoid ReadTimeout during shutdown.
+
 
 def build_app() -> Application:
+    request = HTTPXRequest(
+        connect_timeout=5,  # Fast failure when Heroku restarts the dyno.
+        read_timeout=60,  # Allow long polling sockets to finish cleanly.
+        write_timeout=20,
+        pool_timeout=5,
+    )
+
     application = (
         ApplicationBuilder()
         .token(ensure_token())
         .rate_limiter(AIORateLimiter())
         .concurrent_updates(True)
+        # Explicit request settings avoid httpx.ReadTimeout seen during shutdown/restart.
+        .request(request)
+        # Align getUpdates timeout with our httpx read timeout.
+        .get_updates_request_timeout(DEFAULT_POLL_TIMEOUT)
         .build()
     )
 
@@ -136,6 +152,7 @@ def build_app() -> Application:
 
 async def run_polling(application: Application, shutdown_event: asyncio.Event) -> None:
     """Run the bot until ``shutdown_event`` is set."""
+
     backoff_seconds = 1
     # Application lifecycle is managed explicitly so every coroutine is awaited
     # and the single asyncio loop owned by ``asyncio.run`` stays in control. This
@@ -146,20 +163,25 @@ async def run_polling(application: Application, shutdown_event: asyncio.Event) -
             logging.info("Bot starting polling cycle.")
             await application.initialize()
             await application.start()
-            await application.updater.start_polling()
+            await application.updater.start_polling(
+                timeout=DEFAULT_POLL_TIMEOUT,
+                drop_pending_updates=True,  # Avoid re-processing updates after Heroku restarts.
+            )
 
             logging.info("Bot started and polling.")
             backoff_seconds = 1
             await shutdown_event.wait()
         except asyncio.CancelledError:
             raise
-        except NetworkError as exc:
+        except (NetworkError, TimedOut, httpx.ReadTimeout) as exc:
+            # Avoid noisy stack traces on transient timeouts observed during dyno restarts.
             logging.warning("Telegram network error: %s. Retrying in %s seconds.", exc, backoff_seconds)
         except Exception:
             logging.exception("Polling crashed unexpectedly. Retrying in %s seconds.", backoff_seconds)
         finally:
             try:
-                await application.updater.stop()
+                with contextlib.suppress(TimedOut, httpx.ReadTimeout):
+                    await application.updater.stop()
                 await application.stop()
                 await application.shutdown()
             except Exception:

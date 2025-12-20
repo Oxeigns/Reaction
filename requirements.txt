@@ -2,5 +2,7 @@ python-telegram-bot[ext]==21.6
 pyrogram==2.0.106
 tgcrypto==1.2.5
 motor==3.5.0
+# Explicitly include pymongo to ensure Motor can connect on Heroku dynos.
+pymongo[srv]==4.10.1
 apscheduler==3.10.4
 psutil==6.1.0

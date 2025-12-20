@@ -187,7 +187,15 @@ async def perform_reporting(
     # semantics, so we only import once we know an event loop is already
     # running (inside an async function owned by our single asyncio.run entry).
     from pyrogram.client import Client
-    from pyrogram.errors import BadRequest, FloodWait, RPCError, UsernameNotOccupied, UserDeactivated
+    from pyrogram.errors import (
+        BadRequest,
+        FloodWait,
+        PeerIdInvalid,
+        RPCError,
+        UsernameInvalid,
+        UsernameNotOccupied,
+        UserDeactivated,
+    )
 
     if not (api_id and api_hash):
         ensure_pyrogram_creds()

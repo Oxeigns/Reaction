@@ -14,7 +14,12 @@ from bot.constants import DEFAULT_REPORTS
 from bot.dependencies import API_HASH, API_ID, data_store, ensure_pyrogram_creds
 from bot.state import reset_user_context
 from bot.ui import render_card, report_again_keyboard
-from bot.peer_resolver import normalize_input, report_target
+from bot.target_resolver import (
+    ensure_join_if_needed,
+    fetch_target_details,
+    parse_target,
+    resolve_peer,
+)
 from bot.utils import validate_sessions
 from report import report_profile_photo
 
@@ -252,13 +257,61 @@ async def perform_reporting(
     reason_text = "; ".join(reasons)[:512] or "No reason provided"
 
     try:
-        normalized_target = normalize_input(target)
-        # ``report_target`` uses a TTL cache for permanent failures so repeated
-        # jobs do not hammer invalid/private peers or spam logs with PeerIdInvalid.
-        chat_id, normalized_target = await report_target(clients, target, invite_link=invite_link)
-        normalized_label = normalized_target.username or normalized_target.normalized or normalized_target.raw
+        target_spec = parse_target(target)
+        if invite_link and not target_spec.invite_link:
+            # Preserve the original normalized form but attach the invite link/hash for joining.
+            invite_hash_match = None
+            if "+" in invite_link:
+                invite_hash_match = invite_link.split("+")[-1]
+            else:
+                invite_hash_match = invite_link.rsplit("/", 1)[-1]
+            target_spec = target_spec.__class__(
+                raw=target_spec.raw,
+                normalized=target_spec.normalized,
+                kind="invite" if target_spec.kind == "username" else target_spec.kind,
+                username=target_spec.username,
+                numeric_id=target_spec.numeric_id,
+                invite_hash=invite_hash_match,
+                invite_link=invite_link,
+                message_id=target_spec.message_id,
+                internal_id=target_spec.internal_id,
+            )
 
-        if chat_id is None:
+        normalized_label = target_spec.username or target_spec.normalized or target_spec.raw
+
+        resolved_chat_id: int | None = None
+        target_details: dict | None = None
+        for client in clients:
+            join_result = await ensure_join_if_needed(client, target_spec)
+            if not join_result.ok:
+                logging.warning(
+                    "Join attempt failed for %s via %s: %s", target, client.name, join_result.reason or join_result.error
+                )
+
+            resolution = await resolve_peer(client, target_spec)
+            details = await fetch_target_details(client, resolution)
+            logging.info(
+                "TargetResolver: parsed=%s joined=%s resolved=%s title=%s members=%s",
+                target_spec,
+                join_result.reason or join_result.joined,
+                resolution.method,
+                details.title,
+                details.members,
+            )
+
+            if resolution.ok and resolution.chat_id is not None:
+                resolved_chat_id = resolution.chat_id
+                target_details = {
+                    "type": details.type,
+                    "title": details.title,
+                    "id": details.id,
+                    "username": details.username,
+                    "members": details.members,
+                    "private": details.private,
+                }
+                break
+
+        if resolved_chat_id is None:
             return {
                 "success": 0,
                 "failed": 0,
@@ -266,35 +319,33 @@ async def perform_reporting(
                 "error": "Unable to resolve the target with the available sessions (likely invalid/private).",
             }
 
-        if invite_link:
+        if target_spec.requires_join:
             for client in clients:
-                try:
-                    await client.join_chat(invite_link)
-                except FloodWait as fw:
-                    await asyncio.sleep(getattr(fw, "value", 1))
-                    try:
-                        await client.join_chat(invite_link)
-                    except Exception:
-                        pass
-                except Exception:
-                    logging.exception("Failed to join invite link '%s' with %s", invite_link, client.name)
+                join_result = await ensure_join_if_needed(client, target_spec)
+                if not join_result.ok:
+                    logging.warning(
+                        "Join attempt failed for %s via %s: %s",
+                        target,
+                        client.name,
+                        join_result.reason or join_result.error,
+                    )
 
         success = 0
         failed = 0
-
+        
         halted = False
         invalidated_mid_run: set[str] = set()
 
         async def report_once(client: Client) -> bool:
             nonlocal halted
             try:
-                return await report_profile_photo(client, chat_id, reason=reason_code, reason_text=reason_text)
+                return await report_profile_photo(client, resolved_chat_id, reason=reason_code, reason_text=reason_text)
             except FloodWait as fw:
                 wait_for = getattr(fw, "value", 1)
                 logging.warning("Flood wait %ss while reporting %s via %s", wait_for, target, client.name)
                 await asyncio.sleep(wait_for)
                 try:
-                    return await report_profile_photo(client, chat_id, reason=reason_code, reason_text=reason_text)
+                    return await report_profile_photo(client, resolved_chat_id, reason=reason_code, reason_text=reason_text)
                 except Exception:
                     logging.exception("Retry after flood wait failed for %s via %s", target, client.name)
                     return False

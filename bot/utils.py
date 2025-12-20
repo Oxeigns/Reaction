@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from urllib.parse import urlparse
 
 from pyrogram.errors import PeerIdInvalid, UsernameInvalid, UsernameNotOccupied
@@ -70,21 +71,25 @@ def parse_telegram_url(url: str) -> dict:
     raise ValueError("Unrecognized Telegram URL format")
 
 
-def normalize_target(target: str) -> tuple[str, dict]:
+def normalize_target(target: str | int) -> tuple[str, dict]:
     """Normalize user-supplied target strings to a consistent username/id form.
 
     The function accepts plain usernames, ``@username`` mentions, ``t.me`` links,
     HTTPS ``t.me`` links, and numeric IDs. It returns the normalized identifier
     along with the parsed details so callers can decide how to resolve it.
     """
-
-    raw = target.strip()
+    raw = str(target).strip()
 
     if raw.startswith("@"):
         raw = raw[1:]
 
-    if raw.lstrip("-").isdigit():
-        return raw, {"type": "numeric_id", "id": int(raw)}
+    numeric_candidate = raw.lstrip("+")
+    if numeric_candidate.startswith("-100") or numeric_candidate.lstrip("-").isdigit():
+        try:
+            numeric_id = int(numeric_candidate)
+            return str(numeric_id), {"type": "numeric_id", "id": numeric_id}
+        except ValueError:
+            pass
 
     if "t.me" in raw or raw.startswith("http"):
         try:
@@ -185,27 +190,77 @@ async def resolve_target_peer(client: Client, target: str, invite_link: str | No
             await _refresh_dialogs(client)
 
             if details.get("type") == "invite":
-                chat = await client.get_chat(details["invite_link"])
-                resolved = await client.resolve_peer(chat.id)
-                return resolved, normalized
+                try:
+                    chat = await client.get_chat(details["invite_link"])
+                    resolved = await client.resolve_peer(chat.id)
+                    return resolved, normalized
+                except ValueError as exc:
+                    logging.warning(
+                        "ValueError resolving invite link target '%s' (normalized '%s', invite_link=%s): %s",
+                        target,
+                        normalized,
+                        bool(invite_link),
+                        exc,
+                    )
+                    raise PeerIdInvalid(f"Invalid invite link target: {exc}") from exc
 
             if details.get("type") in {"public_message", "private_message"}:
-                chat = await client.get_chat(details.get("username") or details.get("chat_id"))
-                await client.get_messages(chat.id, details.get("message_id"))
-                resolved = await client.resolve_peer(chat.id)
-                return resolved, normalized
+                try:
+                    chat = await client.get_chat(details.get("username") or details.get("chat_id"))
+                    await client.get_messages(chat.id, details.get("message_id"))
+                    resolved = await client.resolve_peer(chat.id)
+                    return resolved, normalized
+                except ValueError as exc:
+                    logging.warning(
+                        "ValueError resolving message link target '%s' (normalized '%s', invite_link=%s): %s",
+                        target,
+                        normalized,
+                        bool(invite_link),
+                        exc,
+                    )
+                    raise PeerIdInvalid(f"Invalid message link target: {exc}") from exc
 
             if details.get("type") == "story":
-                chat = await client.get_chat(details["username"])
-                resolved = await client.resolve_peer(chat.id)
-                return resolved, normalized
+                try:
+                    chat = await client.get_chat(details["username"])
+                    resolved = await client.resolve_peer(chat.id)
+                    return resolved, normalized
+                except ValueError as exc:
+                    logging.warning(
+                        "ValueError resolving story target '%s' (normalized '%s', invite_link=%s): %s",
+                        target,
+                        normalized,
+                        bool(invite_link),
+                        exc,
+                    )
+                    raise PeerIdInvalid(f"Invalid story target: {exc}") from exc
 
             if details.get("type") == "numeric_id":
-                resolved = await client.resolve_peer(details["id"])
-                return resolved, normalized
+                try:
+                    resolved = await client.resolve_peer(details["id"])
+                    return resolved, normalized
+                except ValueError as exc:
+                    logging.warning(
+                        "ValueError resolving numeric target '%s' (normalized '%s', invite_link=%s): %s",
+                        target,
+                        normalized,
+                        bool(invite_link),
+                        exc,
+                    )
+                    raise PeerIdInvalid(f"Invalid numeric target: {exc}") from exc
 
-            resolved = await client.resolve_peer(details.get("username") or normalized)
-            return resolved, normalized
+            try:
+                resolved = await client.resolve_peer(details.get("username") or normalized)
+                return resolved, normalized
+            except ValueError as exc:
+                logging.warning(
+                    "ValueError resolving username target '%s' (normalized '%s', invite_link=%s): %s",
+                    target,
+                    normalized,
+                    bool(invite_link),
+                    exc,
+                )
+                raise PeerIdInvalid(f"Invalid username target: {exc}") from exc
 
         except (PeerIdInvalid, UsernameNotOccupied, UsernameInvalid) as exc:
             last_exc = exc

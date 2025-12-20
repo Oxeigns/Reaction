@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import os
 from typing import Iterable
 
 try:  # pragma: no cover - optional dependency
@@ -14,8 +15,17 @@ except Exception:  # pragma: no cover - defensive fallback
 class DataStore:
     """Persist session strings and report audit records."""
 
-    def __init__(self, mongo_uri: str | None = None, *, db_name: str = "reporter") -> None:
-        self.mongo_uri = mongo_uri or ""
+    def __init__(
+        self,
+        mongo_uri: str | None = None,
+        *,
+        db_name: str = "reporter",
+        mongo_env_var: str = "MONGO_URI",
+    ) -> None:
+        # Resolve the URI from config or environment so Heroku users can enable
+        # persistence without code changes.
+        self.mongo_env_var = mongo_env_var
+        self.mongo_uri = mongo_uri or os.getenv(self.mongo_env_var, "")
         self._in_memory_sessions: set[str] = set()
         self._in_memory_reports: list[dict] = []
 
@@ -32,9 +42,15 @@ class DataStore:
                 self.db = None
         else:
             if not self.mongo_uri:
-                logging.info("No MONGO_URI provided; using in-memory session storage.")
+                logging.info(
+                    "MongoDB persistence disabled; set %s to a MongoDB connection URI to enable it.",
+                    self.mongo_env_var,
+                )
             elif not motor_asyncio:
-                logging.warning("motor library unavailable; using in-memory session storage.")
+                logging.warning(
+                    "Motor library unavailable; using in-memory session storage. Install 'motor' and set %s to enable persistence.",
+                    self.mongo_env_var,
+                )
 
     async def add_sessions(self, sessions: Iterable[str], added_by: int | None = None) -> list[str]:
         """Add unique session strings and return the list that were newly stored."""
@@ -107,3 +123,9 @@ class DataStore:
     async def close(self) -> None:
         if self.client:
             self.client.close()
+
+    @property
+    def is_persistent(self) -> bool:
+        """Expose whether MongoDB is available for callers that want to log mode."""
+
+        return bool(self.db)

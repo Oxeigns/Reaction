@@ -46,6 +46,12 @@ async def main_async() -> None:
     verify_author_integrity(config.AUTHOR_NAME, config.AUTHOR_HASH)
     build_logger()
 
+    if data_store.is_persistent:
+        logging.info("MongoDB persistence enabled; sessions and reports will survive dyno restarts.")
+    else:
+        logging.info(
+            "Using in-memory storage; set the MONGO_URI environment variable to persist sessions and reports.")
+
     app = build_app()
     shutdown_event = asyncio.Event()
 

@@ -17,6 +17,7 @@ from bot.ui import render_card, report_again_keyboard
 from bot.target_resolver import (
     ensure_join_if_needed,
     fetch_target_details,
+    format_target_details,
     parse_target,
     resolve_peer,
 )
@@ -43,6 +44,98 @@ if TYPE_CHECKING:
 
 def _session_label(session: str) -> str:
     return f"session_{abs(hash(session)) % 10_000}" if session else "session_unknown"
+
+
+async def _preview_target_details(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    target: str,
+    sessions: list[str],
+    *,
+    api_id: int | None,
+    api_hash: str | None,
+    invite_link: str | None,
+    user_id: int | None = None,
+):
+    from pyrogram.client import Client
+
+    if not sessions:
+        return None
+
+    if not (api_id and api_hash):
+        ensure_pyrogram_creds()
+        api_id = API_ID
+        api_hash = API_HASH
+
+    client = Client(
+        name="preview_target",
+        api_id=api_id,
+        api_hash=api_hash,
+        session_string=sessions[0],
+        workdir="/tmp/preview_target",
+    )
+
+    try:
+        await client.start()
+        spec = _target_spec_with_invite(target, invite_link)
+        join_result = await ensure_join_if_needed(client, spec)
+        resolution = await resolve_peer(client, spec)
+        if not resolution.ok:
+            raise ValueError(f"Resolution failed: {resolution.error}")
+
+        details = await fetch_target_details(client, resolution)
+
+        status = "Joined via invite link" if join_result.joined else "Invite verified" if spec.requires_join else "No join needed"
+        detail_text = format_target_details(details)
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"✅ Target resolved.\n{status}.\n\n{detail_text}",
+        )
+
+        logging.info(
+            "Target preview resolved",
+            extra={
+                "user_id": user_id,
+                "session": getattr(client, "name", "preview"),
+                "target_kind": spec.kind,
+                "chat_id": details.id,
+                "resolution_method": resolution.method,
+            },
+        )
+        return {"join": join_result, "resolution": resolution, "details": details}
+    except Exception as exc:  # noqa: BLE001
+        logging.exception(
+            "Target preview failed",
+            extra={"user_id": user_id, "target": target, "session": getattr(client, "name", "preview")},
+        )
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="⚠️ Unable to resolve the target before reporting. Please verify the invite link/URL and try again.",
+        )
+        return None
+    finally:
+        try:
+            await client.stop()
+        except Exception:
+            pass
+
+
+def _target_spec_with_invite(target: str, invite_link: str | None):
+    target_spec = parse_target(target)
+    if invite_link and not target_spec.invite_link:
+        invite_hash_match = invite_link.split("+")[-1] if "+" in invite_link else invite_link.rsplit("/", 1)[-1]
+        target_spec = target_spec.__class__(
+            raw=target_spec.raw,
+            normalized=target_spec.normalized,
+            kind="invite" if target_spec.kind == "username" else target_spec.kind,
+            username=target_spec.username,
+            numeric_id=target_spec.numeric_id,
+            invite_hash=invite_hash_match,
+            invite_link=invite_link,
+            message_id=target_spec.message_id,
+            internal_id=target_spec.internal_id,
+        )
+    return target_spec
 
 
 async def run_report_job(query, context: ContextTypes.DEFAULT_TYPE, job_data: dict) -> None:
@@ -77,16 +170,35 @@ async def run_report_job(query, context: ContextTypes.DEFAULT_TYPE, job_data: di
         for target in targets:
             started = datetime.now(timezone.utc)
             try:
-                summary = await perform_reporting(
+                preview = await _preview_target_details(
+                    context,
+                    chat_id,
                     target,
-                    reasons,
-                    count,
                     sessions,
                     api_id=api_id,
                     api_hash=api_hash,
-                    reason_code=reason_code,
                     invite_link=job_data.get("invite_link"),
+                    user_id=user.id if user else None,
                 )
+
+                if not preview:
+                    summary = {
+                        "success": 0,
+                        "failed": 0,
+                        "halted": True,
+                        "error": "Unable to resolve target before reporting.",
+                    }
+                else:
+                    summary = await perform_reporting(
+                        target,
+                        reasons,
+                        count,
+                        sessions,
+                        api_id=api_id,
+                        api_hash=api_hash,
+                        reason_code=reason_code,
+                        invite_link=job_data.get("invite_link"),
+                    )
             except Exception as exc:  # pragma: no cover - runtime safety
                 logging.exception("Failed to complete reporting job for target '%s'", target)
                 summary = {"success": 0, "failed": 0, "halted": True, "error": str(exc)}
@@ -257,25 +369,7 @@ async def perform_reporting(
     reason_text = "; ".join(reasons)[:512] or "No reason provided"
 
     try:
-        target_spec = parse_target(target)
-        if invite_link and not target_spec.invite_link:
-            # Preserve the original normalized form but attach the invite link/hash for joining.
-            invite_hash_match = None
-            if "+" in invite_link:
-                invite_hash_match = invite_link.split("+")[-1]
-            else:
-                invite_hash_match = invite_link.rsplit("/", 1)[-1]
-            target_spec = target_spec.__class__(
-                raw=target_spec.raw,
-                normalized=target_spec.normalized,
-                kind="invite" if target_spec.kind == "username" else target_spec.kind,
-                username=target_spec.username,
-                numeric_id=target_spec.numeric_id,
-                invite_hash=invite_hash_match,
-                invite_link=invite_link,
-                message_id=target_spec.message_id,
-                internal_id=target_spec.internal_id,
-            )
+        target_spec = _target_spec_with_invite(target, invite_link)
 
         normalized_label = target_spec.username or target_spec.normalized or target_spec.raw
 
@@ -426,6 +520,7 @@ async def perform_reporting(
             "halted": halted,
             "sessions_started": len(clients),
             "sessions_failed": failed_sessions,
+            "details": target_details,
         }
 
     finally:

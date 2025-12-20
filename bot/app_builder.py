@@ -43,6 +43,7 @@ from bot.handlers import (
     handle_api_hash,
     handle_api_id,
     handle_confirmation,
+    handle_navigation,
     handle_private_invite,
     handle_private_message_link,
     handle_public_message_link,
@@ -92,6 +93,8 @@ def build_app() -> Application:
         .build()
     )
 
+    nav_handler = CallbackQueryHandler(handle_navigation, pattern=r"^nav:")
+
     report_conversation = ConversationHandler(
         entry_points=[
             CommandHandler("report", start_report),
@@ -100,21 +103,21 @@ def build_app() -> Application:
             CallbackQueryHandler(handle_report_again, pattern=r"^report_again$"),
         ],
         states={
-            API_ID_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_api_id)],
-            API_HASH_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_api_hash)],
-            REPORT_SESSIONS: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_sessions)],
-            SESSION_MODE: [CallbackQueryHandler(handle_session_mode, pattern=r"^session_mode:")],
-            TARGET_KIND: [CallbackQueryHandler(handle_target_kind, pattern=r"^kind:")],
-            REPORT_URLS: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_report_urls)],
-            PRIVATE_INVITE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_private_invite)],
-            PRIVATE_MESSAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_private_message_link)],
-            PUBLIC_MESSAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_public_message_link)],
-            STORY_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_story_url)],
-            REPORT_REASON_TYPE: [CallbackQueryHandler(handle_reason_type, pattern=r"^reason:")],
-            REPORT_MESSAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_reason_message)],
-            REPORT_COUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_report_count)],
-            ADD_SESSIONS: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_added_sessions)],
-            ConversationHandler.WAITING: [CallbackQueryHandler(handle_confirmation, pattern=r"^confirm:")],
+            API_ID_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_api_id), nav_handler],
+            API_HASH_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_api_hash), nav_handler],
+            REPORT_SESSIONS: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_sessions), nav_handler],
+            SESSION_MODE: [CallbackQueryHandler(handle_session_mode, pattern=r"^session_mode:"), nav_handler],
+            TARGET_KIND: [CallbackQueryHandler(handle_target_kind, pattern=r"^kind:"), nav_handler],
+            REPORT_URLS: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_report_urls), nav_handler],
+            PRIVATE_INVITE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_private_invite), nav_handler],
+            PRIVATE_MESSAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_private_message_link), nav_handler],
+            PUBLIC_MESSAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_public_message_link), nav_handler],
+            STORY_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_story_url), nav_handler],
+            REPORT_REASON_TYPE: [CallbackQueryHandler(handle_reason_type, pattern=r"^reason:"), nav_handler],
+            REPORT_MESSAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_reason_message), nav_handler],
+            REPORT_COUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_report_count), nav_handler],
+            ADD_SESSIONS: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_added_sessions), nav_handler],
+            ConversationHandler.WAITING: [CallbackQueryHandler(handle_confirmation, pattern=r"^confirm:"), nav_handler],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
         allow_reentry=True,

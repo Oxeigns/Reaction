@@ -71,9 +71,13 @@ DEFAULT_POLL_TIMEOUT = 30  # Keep getUpdates sockets alive longer to avoid ReadT
 
 
 def build_app() -> Application:
+    # Configure HTTPXRequest directly so timeouts are set in one place. The builder
+    # level ``get_updates_*_timeout`` helpers are incompatible with a custom
+    # request instance in PTB v20+, which caused startup crashes.
     request = HTTPXRequest(
         connect_timeout=5,  # Fast failure when Heroku restarts the dyno.
-        read_timeout=60,  # Allow long polling sockets to finish cleanly.
+        # Align the underlying HTTP read timeout with the long polling timeout.
+        read_timeout=DEFAULT_POLL_TIMEOUT,
         write_timeout=20,
         pool_timeout=5,
     )
@@ -85,8 +89,6 @@ def build_app() -> Application:
         .concurrent_updates(True)
         # Explicit request settings avoid httpx.ReadTimeout seen during shutdown/restart.
         .request(request)
-        # Align getUpdates timeout with our httpx read timeout.
-        .get_updates_read_timeout(DEFAULT_POLL_TIMEOUT)
         .build()
     )
 

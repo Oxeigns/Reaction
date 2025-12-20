@@ -86,7 +86,7 @@ def build_app() -> Application:
         # Explicit request settings avoid httpx.ReadTimeout seen during shutdown/restart.
         .request(request)
         # Align getUpdates timeout with our httpx read timeout.
-        .get_updates_request_timeout(DEFAULT_POLL_TIMEOUT)
+        .get_updates_read_timeout(DEFAULT_POLL_TIMEOUT)
         .build()
     )
 

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
+import random
 import sys
 import time
 from copy import deepcopy
@@ -36,6 +38,7 @@ from bot.constants import (
     TARGET_KIND,
 )
 from bot.dependencies import API_HASH, API_ID, data_store
+from bot.link_parser import parse_join_target
 from bot.target_resolver import ensure_join_if_needed, fetch_target_details, parse_target, resolve_entity
 from bot.health import format_duration, process_health
 from bot.scheduler import SchedulerManager
@@ -228,6 +231,47 @@ async def _with_resolver_client(context: ContextTypes.DEFAULT_TYPE, callback):
             pass
 
 
+async def _join_target_with_client(client, parsed_link, status_callback, *, max_attempts: int = 3):
+    from pyrogram.errors import FloodWait, RPCError, UserAlreadyParticipant
+
+    me = await client.get_me()
+    join_target = parsed_link.normalized_url if parsed_link.type == "invite" else parsed_link.username or parsed_link.normalized_url
+    join_target = join_target.lstrip("@") if isinstance(join_target, str) else join_target
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            await client.join_chat(join_target)
+            chat = await client.get_chat(join_target)
+            member = await client.get_chat_member(chat.id, me.id)
+            return {"ok": True, "chat": chat, "member": member, "attempt": attempt}
+        except UserAlreadyParticipant:
+            chat = await client.get_chat(join_target)
+            member = await client.get_chat_member(chat.id, me.id)
+            return {"ok": True, "chat": chat, "member": member, "attempt": attempt, "already": True}
+        except FloodWait as exc:
+            wait_seconds = int(getattr(exc, "value", 0) or 0)
+            jitter = random.uniform(1, 3)
+            await status_callback(
+                f"⚠️ FloodWait: Telegram rate limited this client. Wait {wait_seconds} seconds, then I'll retry automatically. "
+                f"(attempt {attempt}/{max_attempts})"
+            )
+            if attempt >= max_attempts:
+                return {
+                    "ok": False,
+                    "error": "flood_wait",
+                    "wait_seconds": wait_seconds,
+                    "detail": str(exc),
+                }
+            await asyncio.sleep(wait_seconds + jitter)
+            continue
+        except RPCError as exc:
+            return {"ok": False, "error": exc.__class__.__name__, "detail": str(exc)}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": exc.__class__.__name__, "detail": str(exc)}
+
+    return {"ok": False, "error": "exhausted"}
+
+
 def _attach_invite(spec, invite_link: str | None):
     if not invite_link or spec.invite_link:
         return spec
@@ -249,6 +293,60 @@ def _attach_invite(spec, invite_link: str | None):
         message_id=spec.message_id,
         internal_id=spec.internal_id,
     )
+
+
+async def _join_and_report(update: Update, context: ContextTypes.DEFAULT_TYPE, link_text: str):
+    try:
+        parsed_link = parse_join_target(link_text)
+    except Exception:
+        await update.effective_message.reply_text(
+            "Please send a valid invite link or public @username (https://t.me/+code or @channel)",
+            reply_markup=navigation_keyboard(),
+        )
+        return None
+
+    async def _status(message: str):
+        await update.effective_message.reply_text(message, reply_markup=navigation_keyboard())
+
+    async def _runner(client):
+        return await _join_target_with_client(client, parsed_link, _status)
+
+    try:
+        result = await _with_resolver_client(context, _runner)
+    except Exception:
+        logging.exception("Join flow failed")
+        await update.effective_message.reply_text(
+            friendly_error("Unable to join this link with the provided session."),
+            reply_markup=navigation_keyboard(),
+        )
+        return None
+
+    if not result or not result.get("ok"):
+        wait_seconds = result.get("wait_seconds") if result else None
+        detail = result.get("detail") if result else None
+        await update.effective_message.reply_text(
+            friendly_error(
+                "Join failed. "
+                + (
+                    f"FloodWait {wait_seconds}s. Please wait and resend." if result and result.get("error") == "flood_wait" else "Please verify the link or try another session."
+                )
+            ),
+            reply_markup=navigation_keyboard(),
+        )
+        if detail:
+            logging.warning("Join failure detail: %s", detail)
+        return None
+
+    chat = result.get("chat")
+    if chat:
+        flow_state(context)["invite_link"] = parsed_link.normalized_url if parsed_link.type == "invite" else None
+        title = getattr(chat, "title", None) or getattr(chat, "first_name", None) or parsed_link.username or "chat"
+        await update.effective_message.reply_text(
+            f"✅ Joined successfully: {title} ({getattr(chat, 'id', 'unknown')})",
+            reply_markup=navigation_keyboard(),
+        )
+
+    return parsed_link
 
 
 def _format_target_details(details) -> str:
@@ -309,8 +407,15 @@ async def _resolve_and_preview_target(update: Update, context: ContextTypes.DEFA
         return False
 
     if not resolution.ok:
+        logging.error(
+            "TargetResolver failed resolution for %s (kind=%s, error=%s)",
+            spec.raw,
+            spec.kind,
+            resolution.error,
+            stack_info=True,
+        )
         await update.effective_message.reply_text(
-            friendly_error("Could not resolve that target. Ensure I have access and the link is correct."),
+            friendly_error("Could not resolve link/chat. Ensure I have access and the link is correct."),
             reply_markup=navigation_keyboard(),
         )
         return False
@@ -753,42 +858,9 @@ async def handle_target_kind(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def handle_private_invite(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = (update.message.text or "").strip()
-    try:
-        parsed = parse_telegram_url(text)
-    except Exception:
-        await update.effective_message.reply_text(
-            "Please send a valid private invite link (https://t.me/+code)", reply_markup=navigation_keyboard()
-        )
-        return PRIVATE_INVITE
 
-    if parsed.get("type") != "invite":
-        await update.effective_message.reply_text(
-            "Please send a valid private invite link (https://t.me/+code)", reply_markup=navigation_keyboard()
-        )
-        return PRIVATE_INVITE
-
-    flow_state(context)["invite_link"] = parsed.get("invite_link")
-
-    invite_preview = parse_target(text)
-
-    async def _runner(client):
-        return await ensure_join_if_needed(client, invite_preview)
-
-    try:
-        join_result = await _with_resolver_client(context, _runner)
-    except Exception as exc:  # noqa: BLE001
-        logging.exception("Failed to join invite during private flow")
-        await update.effective_message.reply_text(
-            friendly_error("Unable to join this invite with the provided session."),
-            reply_markup=navigation_keyboard(),
-        )
-        return PRIVATE_INVITE
-
-    if not join_result.ok:
-        await update.effective_message.reply_text(
-            friendly_error("Join failed. Please verify the invite link or try another session."),
-            reply_markup=navigation_keyboard(),
-        )
+    parsed_link = await _join_and_report(update, context, text)
+    if not parsed_link:
         return PRIVATE_INVITE
 
     await update.effective_message.reply_text(

@@ -14,6 +14,7 @@ from pyrogram.errors import (
 from pyrogram import Client
 
 from bot.dependencies import API_HASH, API_ID
+from bot.link_parser import maybe_parse_join_target
 
 
 def friendly_error(message: str) -> str:
@@ -34,9 +35,7 @@ def parse_links(text: str) -> list[str]:
 
 
 def is_valid_link(text: str) -> bool:
-    text = text.strip()
-    parsed = urlparse(text if text.startswith("http") else f"https://{text}")
-    return parsed.netloc.endswith("t.me") and len(parsed.path.strip("/")) > 0
+    return maybe_parse_join_target(text) is not None
 
 
 def parse_telegram_url(url: str) -> dict:
@@ -45,9 +44,6 @@ def parse_telegram_url(url: str) -> dict:
 
     if not parsed.netloc.endswith("t.me") or not path_parts:
         raise ValueError("Invalid Telegram URL")
-
-    if path_parts[0].startswith("+"):
-        return {"type": "invite", "invite_link": f"https://t.me/{path_parts[0]}"}
 
     if path_parts[0] == "c" and len(path_parts) >= 3:
         if not path_parts[1].isdigit() or not path_parts[2].isdigit():
@@ -72,6 +68,20 @@ def parse_telegram_url(url: str) -> dict:
             "type": "public_message",
             "username": path_parts[0],
             "message_id": int(path_parts[1]),
+        }
+
+    parsed_join = maybe_parse_join_target(url)
+    if parsed_join:
+        if parsed_join.type == "invite":
+            return {
+                "type": "invite",
+                "invite_link": parsed_join.normalized_url,
+                "invite_hash": parsed_join.invite_hash,
+            }
+        return {
+            "type": "username",
+            "username": parsed_join.username,
+            "invite_link": parsed_join.normalized_url if parsed_join.invite_hash else None,
         }
 
     if len(path_parts) == 1:

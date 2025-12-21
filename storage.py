@@ -33,9 +33,9 @@ class DataStore:
         self.db = None
         if self.mongo_uri:
             if motor_asyncio is None:
-                logging.error(
+                logging.warning(
                     "MongoDB URI provided but Motor is unavailable; install 'motor' to enable persistence. "
-                    "Falling back to in-memory storage.",
+                    "Using in-memory storage.",
                 )
             else:
                 try:

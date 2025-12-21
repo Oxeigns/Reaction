@@ -16,6 +16,15 @@ class ParsedTelegramLink:
     username: str | None = None
 
 
+@dataclass(frozen=True)
+class ParsedMessageLink:
+    type: Literal["public_message", "private_message"]
+    chat_ref: str | int
+    message_id: int
+    internal_id: int | None = None
+    username: str | None = None
+
+
 _TRAILING_PUNCTUATION = ",.;)]}>'\""
 
 
@@ -23,6 +32,52 @@ def _clean_input(text: str) -> str:
     cleaned = (text or "").strip()
     cleaned = cleaned.rstrip(_TRAILING_PUNCTUATION)
     return cleaned
+
+
+def parse_message_link(raw: str) -> ParsedMessageLink:
+    """Parse Telegram message links in both public and private (/c) forms.
+
+    Supports:
+    - https://t.me/<username>/<msg_id>
+    - https://t.me/c/<internal_id>/<msg_id>
+    - Links without scheme (t.me/...) or with query strings.
+    """
+
+    cleaned = _clean_input(raw)
+    if not cleaned:
+        raise ValueError("Empty link")
+
+    parsed = urlparse(cleaned if cleaned.startswith("http") else f"https://{cleaned}")
+    path_parts = [p for p in parsed.path.split("/") if p]
+
+    if not parsed.netloc.endswith("t.me") or len(path_parts) < 2:
+        raise ValueError("Not a Telegram message link")
+
+    if path_parts[0].lower() == "c":
+        if len(path_parts) < 3 or not path_parts[1].isdigit() or not path_parts[2].isdigit():
+            raise ValueError("Invalid private message link")
+        internal_id = int(path_parts[1])
+        message_id = int(path_parts[2])
+        return ParsedMessageLink(
+            type="private_message",
+            internal_id=internal_id,
+            chat_ref=int(f"-100{internal_id}"),
+            message_id=message_id,
+        )
+
+    if not path_parts[1].isdigit():
+        raise ValueError("Invalid public message link")
+
+    username = path_parts[0].lstrip("@")
+    if not username:
+        raise ValueError("Username is missing")
+
+    return ParsedMessageLink(
+        type="public_message",
+        username=username,
+        chat_ref=username,
+        message_id=int(path_parts[1]),
+    )
 
 
 def _parse_invite_hash_from_url(parsed) -> str | None:
@@ -119,4 +174,10 @@ def maybe_parse_join_target(raw: str) -> ParsedTelegramLink | None:
         return None
 
 
-__all__ = ["ParsedTelegramLink", "parse_join_target", "maybe_parse_join_target"]
+__all__ = [
+    "ParsedTelegramLink",
+    "ParsedMessageLink",
+    "parse_join_target",
+    "parse_message_link",
+    "maybe_parse_join_target",
+]

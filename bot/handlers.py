@@ -383,46 +383,86 @@ async def _resolve_and_preview_target(update: Update, context: ContextTypes.DEFA
     invite_link = flow_state(context).get("invite_link")
     spec = _attach_invite(parse_target(target_text), invite_link)
 
+    status_message = await update.effective_message.reply_text(
+        "🔍 Resolving target…", reply_markup=navigation_keyboard()
+    )
+
+    async def _set_status(text: str) -> None:
+        try:
+            await status_message.edit_text(
+                text, reply_markup=navigation_keyboard(), parse_mode=ParseMode.HTML
+            )
+        except Exception:
+            logging.exception("Failed to update resolution status")
+
     async def _runner(client):
+        join_info = None
+        resolution = None
+        details = None
+        message = None
+
+        await _set_status("🔗 Joining chat…" if spec.requires_join else "🔎 Resolving chat…")
         join_info = await ensure_join_if_needed(client, spec)
+        if join_info and not join_info.ok:
+            return join_info, None, None, None
+
         resolution = await resolve_entity(client, spec)
         details = await fetch_target_details(client, resolution)
-        return join_info, resolution, details
+
+        if resolution.ok and spec.message_id:
+            await _set_status("📥 Fetching message…")
+            chat_ref: int | str
+            if spec.kind == "internal_message" and spec.internal_id:
+                chat_ref = int(f"-100{spec.internal_id}")
+            elif resolution.chat_id:
+                chat_ref = resolution.chat_id
+            else:
+                chat_ref = spec.username or spec.normalized
+
+            try:
+                message = await client.get_messages(chat_ref, spec.message_id)
+            except Exception as exc:  # noqa: BLE001
+                logging.exception("Failed to fetch message preview", exc_info=exc)
+                return join_info, resolution, details, None
+
+        return join_info, resolution, details, message
 
     try:
-        join_info, resolution, details = await _with_resolver_client(context, _runner)
+        join_info, resolution, details, message = await _with_resolver_client(context, _runner)
     except Exception as exc:  # noqa: BLE001
         logging.exception("Target preview failed")
-        await update.effective_message.reply_text(
+        await _set_status(
             friendly_error("Unable to reach this target right now. Please verify the link and try again."),
-            reply_markup=navigation_keyboard(),
         )
         return False
 
     if join_info and not join_info.ok:
-        await update.effective_message.reply_text(
+        await _set_status(
             friendly_error("I could not join the invite link. Please provide a valid invite or try another session."),
-            reply_markup=navigation_keyboard(),
         )
         return False
 
-    if not resolution.ok:
+    if not resolution or not resolution.ok:
         logging.error(
             "TargetResolver failed resolution for %s (kind=%s, error=%s)",
             spec.raw,
             spec.kind,
-            resolution.error,
+            resolution.error if resolution else "unknown",
             stack_info=True,
         )
-        await update.effective_message.reply_text(
+        await _set_status(
             friendly_error("Could not resolve link/chat. Ensure I have access and the link is correct."),
-            reply_markup=navigation_keyboard(),
         )
         return False
 
-    await update.effective_message.reply_text(
-        _format_target_details(details), parse_mode=ParseMode.HTML, reply_markup=navigation_keyboard(show_back=False)
-    )
+    preview_lines = ["✅ Done!", _format_target_details(details)]
+    if spec.message_id:
+        preview_lines.append(f"Message ID: <code>{spec.message_id}</code>")
+    if message:
+        snippet = message.text or message.caption or "<no text>"
+        preview_lines.append(f"Preview: {escape(snippet[:200])}")
+
+    await _set_status("\n".join(preview_lines))
     return True
 
 

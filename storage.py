@@ -31,26 +31,29 @@ class DataStore:
 
         self.client = None
         self.db = None
-        if self.mongo_uri and motor_asyncio:
-            try:
-                self.client = motor_asyncio.AsyncIOMotorClient(self.mongo_uri)
-                self.db = self.client.get_default_database() or self.client[db_name]
-                logging.info("Connected to MongoDB for session persistence.")
-            except Exception:
-                logging.exception("Failed to initialize MongoDB client; falling back to in-memory storage.")
-                self.client = None
-                self.db = None
+        if self.mongo_uri:
+            if motor_asyncio is None:
+                logging.error(
+                    "MongoDB URI provided but Motor is unavailable; install 'motor' to enable persistence. "
+                    "Falling back to in-memory storage.",
+                )
+            else:
+                try:
+                    self.client = motor_asyncio.AsyncIOMotorClient(self.mongo_uri)
+                    self.db = self.client.get_default_database() or self.client[db_name]
+                    logging.info("Connected to MongoDB for session persistence.")
+                except Exception:
+                    logging.exception(
+                        "Failed to initialize MongoDB client with %s; falling back to in-memory storage.",
+                        self.mongo_env_var,
+                    )
+                    self.client = None
+                    self.db = None
         else:
-            if not self.mongo_uri:
-                logging.info(
-                    "MongoDB persistence disabled; set %s to a MongoDB connection URI to enable it.",
-                    self.mongo_env_var,
-                )
-            elif not motor_asyncio:
-                logging.warning(
-                    "Motor library unavailable; using in-memory session storage. Install 'motor' and set %s to enable persistence.",
-                    self.mongo_env_var,
-                )
+            logging.info(
+                "MongoDB persistence disabled; set %s to a MongoDB connection URI to enable it.",
+                self.mongo_env_var,
+            )
 
     async def add_sessions(self, sessions: Iterable[str], added_by: int | None = None) -> list[str]:
         """Add unique session strings and return the list that were newly stored."""

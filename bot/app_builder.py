@@ -121,9 +121,12 @@ def build_app() -> Application:
         },
         fallbacks=[CommandHandler("cancel", cancel)],
         allow_reentry=True,
-        # Use per_message=False to allow CommandHandler/MessageHandler states.
+        # Track the conversation per-user (not per-message) so callback query
+        # updates from inline buttons stay inside the flow. PTB emits a warning
+        # when per_message=True with CallbackQueryHandler entries, so we make
+        # the conversation user-scoped and message-agnostic here.
         per_message=False,
-        per_chat=True,
+        per_chat=False,
         per_user=True,
     )
 
@@ -132,9 +135,9 @@ def build_app() -> Application:
         states={ADD_SESSIONS: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_added_sessions)]},
         fallbacks=[CommandHandler("cancel", cancel)],
         allow_reentry=True,
-        # Use per_message=False to allow CommandHandler/MessageHandler states.
+        # Keep callback query navigation working by tracking per-user only.
         per_message=False,
-        per_chat=True,
+        per_chat=False,
         per_user=True,
     )
 

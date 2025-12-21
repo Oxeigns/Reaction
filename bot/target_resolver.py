@@ -109,6 +109,31 @@ def parse_target(raw_input: str) -> TargetSpec:
 
     cleaned = _strip_query(raw)
 
+    parsed = urlparse(cleaned if cleaned.startswith("http") else f"https://{cleaned}")
+    path_parts: list[str] = [part for part in parsed.path.split("/") if part]
+    netloc = parsed.netloc.lower()
+
+    if netloc.endswith("t.me") and path_parts:
+        first = path_parts[0]
+        if first.startswith("+"):
+            invite_hash = first.lstrip("+")
+            return TargetSpec(
+                raw=raw,
+                normalized=f"invite:{invite_hash}",
+                kind="invite",
+                invite_hash=invite_hash,
+                invite_link=f"https://t.me/+{invite_hash}",
+            )
+        if first.lower() == "joinchat" and len(path_parts) >= 2:
+            invite_hash = path_parts[1]
+            return TargetSpec(
+                raw=raw,
+                normalized=f"invite:{invite_hash}",
+                kind="invite",
+                invite_hash=invite_hash,
+                invite_link=f"https://t.me/joinchat/{invite_hash}",
+            )
+
     message_link = maybe_parse_message_link(cleaned)
     if message_link:
         if message_link.is_private:
@@ -143,10 +168,6 @@ def parse_target(raw_input: str) -> TargetSpec:
             numeric_id=numeric_id,
         )
 
-    parsed = urlparse(cleaned if cleaned.startswith("http") else f"https://{cleaned}")
-    path_parts: list[str] = [part for part in parsed.path.split("/") if part]
-    netloc = parsed.netloc.lower()
-
     if netloc.endswith("t.me") and not path_parts:
         raise ValueError("The t.me link is missing a username.")
 
@@ -164,28 +185,6 @@ def parse_target(raw_input: str) -> TargetSpec:
             internal_id=internal_id,
             message_id=message_id,
         )
-
-    # Invite links
-    if netloc.endswith("t.me") and path_parts:
-        first = path_parts[0]
-        if first.startswith("+"):
-            invite_hash = first.lstrip("+")
-            return TargetSpec(
-                raw=raw,
-                normalized=f"invite:{invite_hash}",
-                kind="invite",
-                invite_hash=invite_hash,
-                invite_link=f"https://t.me/+{invite_hash}",
-            )
-        if first.lower() == "joinchat" and len(path_parts) >= 2:
-            invite_hash = path_parts[1]
-            return TargetSpec(
-                raw=raw,
-                normalized=f"invite:{invite_hash}",
-                kind="invite",
-                invite_hash=invite_hash,
-                invite_link=f"https://t.me/joinchat/{invite_hash}",
-            )
 
     # Message links with username
     if netloc.endswith("t.me") and len(path_parts) >= 2 and path_parts[1].isdigit():

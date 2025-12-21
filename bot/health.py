@@ -23,7 +23,10 @@ def uptime_seconds() -> float:
     return max(0.0, time.monotonic() - PROCESS_START_TIME)
 
 
-def format_duration(seconds: float) -> str:
+def format_duration(seconds: float | dt.timedelta) -> str:
+    if isinstance(seconds, dt.timedelta):
+        seconds = seconds.total_seconds()
+
     seconds_int = int(seconds)
     days, remainder = divmod(seconds_int, 86400)
     hours, remainder = divmod(remainder, 3600)

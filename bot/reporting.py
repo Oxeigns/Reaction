@@ -85,10 +85,12 @@ async def run_report_job(query, context: ContextTypes.DEFAULT_TYPE, job_data: di
                 setup_lines = ["**Setup**"]
                 join_state = payload.get("join", {})
                 if join_state:
-                    join_ok = join_state.get("completed") and join_state.get("errors") == 0
+                    join_completed = join_state.get("completed")
+                    join_errors = join_state.get("errors", 0)
+                    join_status = "✅" if join_completed and join_errors == 0 else "⚠️" if join_completed else "⏳"
+                    status_label = "all clients joined" if join_errors == 0 else "join attempts"
                     setup_lines.append(
-                        f"- join: {'✅' if join_ok else '⏳'} all clients joined ({join_state.get('joined', 0)}/"
-                        f"{join_state.get('total', 0)})"
+                        f"- join: {join_status} {status_label} ({join_state.get('joined', 0)}/{join_state.get('total', 0)})"
                     )
                     last_join_reason = join_state.get("last_reason")
                     if last_join_reason:
@@ -354,30 +356,35 @@ async def perform_reporting(
 
         join_progress: dict[str, dict] = {}
         joined = 0
+        joined_clients: list[Client] = []
+        join_total = len(clients)
+        max_join_attempts = 2
         for client in clients:
             join_progress[client.name] = {"status": "JOINING", "success": 0, "reason": None, "retry_after": None}
 
         if target_spec.requires_join:
-            await _push_status({"join": {"total": len(clients), "joined": joined, "errors": 0}})
+            await _push_status({"join": {"total": join_total, "joined": joined, "errors": 0}})
             for client in clients:
                 attempts = 0
-                while attempts < 5:
+                while attempts < max_join_attempts:
                     attempts += 1
                     try:
                         join_result = await ensure_join_if_needed(client, target_spec)
                         if join_result.ok:
                             joined += 1
+                            joined_clients.append(client)
                             join_progress[client.name].update({"status": "SUCCESS", "success": 1, "reason": join_result.reason})
                             break
                         join_progress[client.name].update({"status": "FAILED", "reason": join_result.reason})
-                        break
+                        if attempts >= max_join_attempts:
+                            break
                     except Exception as exc:  # noqa: BLE001
                         code, detail, wait_seconds = map_pyrogram_error(exc)
                         join_progress[client.name].update({"status": code, "reason": detail, "retry_after": wait_seconds})
                         await _push_status(
                             {
                                 "join": {
-                                    "total": len(clients),
+                                    "total": join_total,
                                     "joined": joined,
                                     "errors": len([c for c in join_progress.values() if c.get("status") not in {"SUCCESS", "JOINING"}]),
                                     "last_reason": f"{code}: {detail}",
@@ -385,30 +392,33 @@ async def perform_reporting(
                                 "report": {"clients": join_progress},
                             }
                         )
-                        if code == "FLOOD_WAIT" and attempts < 5 and wait_seconds:
+                        if code == "FLOOD_WAIT" and attempts < max_join_attempts and wait_seconds:
                             await asyncio.sleep(wait_seconds)
                             continue
                         break
 
+            join_errors = len([c for c in join_progress.values() if c.get("status") not in {"SUCCESS", "JOINING"}])
             await _push_status(
                 {
                     "join": {
-                        "total": len(clients),
+                        "total": join_total,
                         "joined": joined,
-                        "errors": len([c for c in join_progress.values() if c.get("status") not in {"SUCCESS", "JOINING"}]),
-                        "completed": joined == len(clients),
+                        "errors": join_errors,
+                        "completed": True,
                         "last_reason": None,
                     },
                     "report": {"clients": join_progress},
                 }
             )
-            if joined < len(clients):
+            if joined_clients:
+                clients = joined_clients
+            else:
                 return {
                     "success": 0,
                     "failed": 0,
                     "halted": True,
-                    "error": "Join step failed for one or more clients",
-                    "sessions_started": len(clients),
+                    "error": "Join step failed for all clients",
+                    "sessions_started": join_total,
                     "sessions_failed": failed_sessions,
                 }
 

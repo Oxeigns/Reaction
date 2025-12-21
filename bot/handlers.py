@@ -929,18 +929,11 @@ async def handle_story_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             "Send a valid story URL or username.", reply_markup=navigation_keyboard()
         )
         return STORY_URL
-
-    flow = flow_state(context)
-    flow["targets"] = [text]
-    flow["target_kind"] = "story"
-
-    if not await _resolve_and_preview_target(update, context, text):
-        return STORY_URL
-
     await update.effective_message.reply_text(
-        REASON_PROMPT, reply_markup=reason_keyboard()
+        "NOT_SUPPORTED: profile/story URLs are not supported for reporting.",
+        reply_markup=navigation_keyboard(),
     )
-    return REPORT_REASON_TYPE
+    return ConversationHandler.END
 
 
 async def handle_report_urls(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:

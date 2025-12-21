@@ -43,6 +43,12 @@ class ParseTargetTest(unittest.TestCase):
         self.assertEqual(parsed_internal.message_id, 99)
         self.assertEqual(parsed_internal.normalized, "c/12345")
 
+    def test_invalid_inputs_raise(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_target("")
+        with self.assertRaises(ValueError):
+            parse_target("https://t.me/")
+
 
 if __name__ == "__main__":
     unittest.main()

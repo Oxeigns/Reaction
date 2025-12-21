@@ -15,7 +15,9 @@ This project provides a Telegram bot that coordinates multiple Pyrogram session 
 - Python 3.10+
 - Telegram Bot Token
 - Telegram API ID and API Hash (https://my.telegram.org)
-- MongoDB connection string (optional but recommended for session persistence)
+- MongoDB connection string (optional but recommended for session persistence). If
+  `MONGO_URI` is set, the bot will use Motor/PyMongo for durable storage; leave it
+  empty to fall back to in-memory mode.
 - Dependencies from `requirements.txt`
 
 ## Deploy to Heroku

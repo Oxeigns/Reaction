@@ -276,6 +276,7 @@ async def perform_reporting(
 
         resolved_chat_id: int | None = None
         target_details: dict | None = None
+        fatal_resolution_error: str | None = None
         for client in clients:
             join_result = await ensure_join_if_needed(client, target_spec)
             if not join_result.ok:
@@ -306,14 +307,19 @@ async def perform_reporting(
                 }
                 break
 
+            if resolution.error in {"PeerIdInvalid", "ChannelInvalid", "ChannelPrivate", "ChatIdInvalid", "invalid_invite"}:
+                fatal_resolution_error = resolution.error
+                break
+
         if resolved_chat_id is None:
             return {
                 "success": 0,
                 "failed": 0,
                 "halted": False,
-                "error": "Unable to resolve the target with the available sessions (likely invalid/private).",
+                "error": fatal_resolution_error
+                or "Unable to resolve the target with the available sessions (likely invalid/private).",
             }
-
+    
         if target_spec.requires_join:
             for client in clients:
                 join_result = await ensure_join_if_needed(client, target_spec)
@@ -423,6 +429,8 @@ async def perform_reporting(
             "sessions_failed": failed_sessions,
         }
 
+    except ValueError as exc:
+        return {"success": 0, "failed": 0, "halted": False, "error": str(exc)}
     finally:
         for client in clients:
             try:

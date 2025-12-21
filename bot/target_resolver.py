@@ -62,6 +62,17 @@ class TargetDetails:
 
 _CACHE: dict[str, tuple[ResolvedTarget, datetime]] = {}
 _CACHE_TTL = timedelta(minutes=10)
+_FAILURE_CACHE: dict[str, tuple[ResolvedTarget, datetime]] = {}
+_FAILURE_TTL = timedelta(minutes=5)
+_FATAL_ERRORS = {
+    "PeerIdInvalid",
+    "ChannelInvalid",
+    "ChannelPrivate",
+    "ChatIdInvalid",
+    "UsernameInvalid",
+    "UsernameNotOccupied",
+    "invalid_invite",
+}
 
 
 def _strip_query(url: str) -> str:
@@ -80,6 +91,9 @@ def parse_target(raw_input: str) -> TargetSpec:
     """
 
     raw = (raw_input or "").strip()
+    if not raw:
+        raise ValueError("Target is empty; provide a username, invite link, or numeric ID.")
+
     cleaned = _strip_query(raw)
 
     # Numeric IDs (-100..., user id, etc.)
@@ -102,11 +116,16 @@ def parse_target(raw_input: str) -> TargetSpec:
     path_parts: list[str] = [part for part in parsed.path.split("/") if part]
     netloc = parsed.netloc.lower()
 
+    if netloc.endswith("t.me") and not path_parts:
+        raise ValueError("The t.me link is missing a username.")
+
     # Internal message links (t.me/c/<id>/<msg>)
     if netloc.endswith("t.me") and path_parts and path_parts[0].lower() == "c":
         internal_id = int(path_parts[1]) if len(path_parts) >= 2 and path_parts[1].isdigit() else None
         message_id = int(path_parts[2]) if len(path_parts) >= 3 and path_parts[2].isdigit() else None
         normalized = f"c/{internal_id}" if internal_id is not None else "c"
+        if internal_id is None:
+            raise ValueError("Internal message link missing chat id.")
         return TargetSpec(
             raw=raw,
             normalized=normalized,
@@ -152,62 +171,105 @@ def parse_target(raw_input: str) -> TargetSpec:
     # Plain username/link
     if netloc.endswith("t.me") and path_parts:
         username = path_parts[0].lstrip("@")
+        if not username:
+            raise ValueError("The t.me link is missing a username.")
         return TargetSpec(raw=raw, normalized=username, kind="username", username=username)
 
     # Bare usernames like @foo or foo
     username = raw.lstrip("@")
     normalized = username
+    if not normalized:
+        raise ValueError("Unable to parse the target. Please provide a valid username or link.")
+
     return TargetSpec(raw=raw, normalized=normalized, kind="username", username=username)
 
 
 async def ensure_join_if_needed(client: Any, target_spec: TargetSpec) -> JoinResult:
-    from pyrogram.errors import ChatAdminRequired, FloodWait, InviteHashInvalid, UserAlreadyParticipant
+    from pyrogram.errors import (
+        ChatAdminRequired,
+        FloodWait,
+        InviteHashExpired,
+        InviteHashInvalid,
+        RPCError,
+        UserAlreadyParticipant,
+    )
 
     if not target_spec.invite_link and not target_spec.invite_hash:
         return JoinResult(ok=True, joined=False)
 
     invite_link = target_spec.invite_link or f"https://t.me/+{target_spec.invite_hash}"
-    try:
-        await client.join_chat(invite_link)
-        logging.info(
-            "TargetResolver: joined invite",
-            extra={
-                "invite_link": invite_link,
-                "session_name": getattr(client, "name", "client"),
-                "step": "ensure_join",
-            },
-        )
-        return JoinResult(ok=True, joined=True)
-    except UserAlreadyParticipant:
-        logging.info(
-            "TargetResolver: already participant",
-            extra={"invite_link": invite_link, "session_name": getattr(client, "name", "client"), "step": "ensure_join"},
-        )
-        return JoinResult(ok=True, joined=False, reason="already_participant")
-    except FloodWait as fw:
-        wait_seconds = min(getattr(fw, "value", 1), 60)
-        logging.warning("Flood wait %ss while joining %s", wait_seconds, invite_link)
-        await asyncio.sleep(wait_seconds)
+    attempts = 0
+    while attempts < 3:
+        attempts += 1
         try:
             await client.join_chat(invite_link)
+            logging.info(
+                "TargetResolver: joined invite",
+                extra={
+                    "invite_link": invite_link,
+                    "session_name": getattr(client, "name", "client"),
+                    "step": "ensure_join",
+                    "attempt": attempts,
+                },
+            )
             return JoinResult(ok=True, joined=True)
+        except UserAlreadyParticipant:
+            logging.info(
+                "TargetResolver: already participant",
+                extra={
+                    "invite_link": invite_link,
+                    "session_name": getattr(client, "name", "client"),
+                    "step": "ensure_join",
+                },
+            )
+            return JoinResult(ok=True, joined=False, reason="already_participant")
+        except FloodWait as fw:
+            wait_seconds = min(getattr(fw, "value", 1), 60)
+            logging.warning(
+                "Flood wait %ss while joining %s (attempt %s)", wait_seconds, invite_link, attempts
+            )
+            await asyncio.sleep(wait_seconds)
+            continue
+        except (InviteHashInvalid, InviteHashExpired) as exc:
+            logging.error(
+                "TargetResolver: invalid invite",
+                extra={
+                    "invite_link": invite_link,
+                    "session_name": getattr(client, "name", "client"),
+                    "step": "ensure_join",
+                    "error": exc.__class__.__name__,
+                },
+            )
+            return JoinResult(ok=False, joined=False, reason="invalid_invite", error=str(exc))
+        except ChatAdminRequired as exc:
+            return JoinResult(ok=False, joined=False, reason="admin_required", error=str(exc))
+        except RPCError as exc:
+            # Retry transient RPC errors once with a short delay.
+            logging.warning(
+                "TargetResolver: transient join failure",
+                extra={
+                    "invite_link": invite_link,
+                    "session_name": getattr(client, "name", "client"),
+                    "step": "ensure_join",
+                    "error": exc.__class__.__name__,
+                    "attempt": attempts,
+                },
+            )
+            await asyncio.sleep(min(5, attempts))
+            continue
         except Exception as exc:  # noqa: BLE001
-            return JoinResult(ok=False, joined=False, reason="join_failed_after_wait", error=str(exc))
-    except InviteHashInvalid as exc:
-        return JoinResult(ok=False, joined=False, reason="invalid_invite", error=str(exc))
-    except ChatAdminRequired as exc:
-        return JoinResult(ok=False, joined=False, reason="admin_required", error=str(exc))
-    except Exception as exc:  # noqa: BLE001
-        logging.exception(
-            "TargetResolver: unexpected join failure",
-            extra={
-                "invite_link": invite_link,
-                "session_name": getattr(client, "name", "client"),
-                "step": "ensure_join",
-                "error": exc.__class__.__name__,
-            },
-        )
-        return JoinResult(ok=False, joined=False, reason="join_failed", error=str(exc))
+            logging.exception(
+                "TargetResolver: unexpected join failure",
+                extra={
+                    "invite_link": invite_link,
+                    "session_name": getattr(client, "name", "client"),
+                    "step": "ensure_join",
+                    "error": exc.__class__.__name__,
+                },
+            )
+            return JoinResult(ok=False, joined=False, reason="join_failed", error=str(exc))
+
+    return JoinResult(ok=False, joined=False, reason="join_exhausted", error="join attempts exceeded")
 
 
 async def ensure_joined(client: Any, target_spec: TargetSpec) -> JoinResult:
@@ -229,12 +291,9 @@ async def resolve_peer(client: Any, target_spec: TargetSpec, *, max_attempts: in
         UsernameNotOccupied,
     )
 
-    _purge_cache()
-    cache_entry = _CACHE.get(target_spec.cache_key())
-    if cache_entry:
-        resolved, expires_at = cache_entry
-        if expires_at > datetime.now(timezone.utc):
-            return resolved
+    cached = _get_cached_resolution(target_spec)
+    if cached:
+        return cached
 
     attempts = 0
     last_error: str | None = None
@@ -257,28 +316,65 @@ async def resolve_peer(client: Any, target_spec: TargetSpec, *, max_attempts: in
 
             chat_id = _chat_id_from_chat(chat)
             resolved = ResolvedTarget(ok=True, peer=chat, chat_id=chat_id, method=method)
-            _CACHE[target_spec.cache_key()] = (resolved, datetime.now(timezone.utc) + _CACHE_TTL)
+            _cache_resolution(target_spec, resolved)
+            logging.info(
+                "TargetResolver: resolved target",
+                extra={
+                    "target": target_spec.raw,
+                    "normalized": target_spec.normalized,
+                    "kind": target_spec.kind,
+                    "method": method,
+                    "chat_id": chat_id,
+                    "session_name": getattr(client, "name", "client"),
+                },
+            )
             return resolved
         except FloodWait as fw:
             wait_seconds = min(getattr(fw, "value", 1), 60)
+            logging.warning(
+                "Flood wait %ss while resolving %s (attempt %s)",
+                wait_seconds,
+                target_spec.raw,
+                attempts,
+            )
             await asyncio.sleep(wait_seconds)
             last_error = fw.__class__.__name__
             continue
         except (UsernameNotOccupied, UsernameInvalid, PeerIdInvalid, ChannelInvalid, ChannelPrivate, ChatIdInvalid) as exc:
             last_error = exc.__class__.__name__
-            return ResolvedTarget(ok=False, peer=None, chat_id=None, method=method, error=last_error)
+            resolved = ResolvedTarget(ok=False, peer=None, chat_id=None, method=method, error=last_error)
+            _cache_resolution(target_spec, resolved, failure=True)
+            return resolved
         except BadRequest as exc:
             last_error = exc.__class__.__name__
-            return ResolvedTarget(ok=False, peer=None, chat_id=None, method=method, error=last_error)
+            resolved = ResolvedTarget(ok=False, peer=None, chat_id=None, method=method, error=last_error)
+            _cache_resolution(target_spec, resolved, failure=True)
+            return resolved
         except RPCError as exc:
             last_error = exc.__class__.__name__
+            logging.warning(
+                "TargetResolver: RPC error while resolving",
+                extra={
+                    "target": target_spec.raw,
+                    "kind": target_spec.kind,
+                    "method": method,
+                    "error": last_error,
+                    "attempt": attempts,
+                    "session_name": getattr(client, "name", "client"),
+                },
+            )
             await asyncio.sleep(min(3, attempts))
             continue
         except Exception as exc:  # noqa: BLE001
             last_error = exc.__class__.__name__
-            return ResolvedTarget(ok=False, peer=None, chat_id=None, method=method, error=last_error)
+            resolved = ResolvedTarget(ok=False, peer=None, chat_id=None, method=method, error=last_error)
+            _cache_resolution(target_spec, resolved, failure=True)
+            return resolved
 
-    return ResolvedTarget(ok=False, peer=None, chat_id=None, method=None, error=last_error)
+    resolved = ResolvedTarget(ok=False, peer=None, chat_id=None, method=None, error=last_error)
+    if last_error in _FATAL_ERRORS:
+        _cache_resolution(target_spec, resolved, failure=True)
+    return resolved
 
 
 async def resolve_entity(client: Any, target_spec: TargetSpec, *, max_attempts: int = 3) -> ResolvedTarget:
@@ -290,6 +386,10 @@ async def resolve_entity(client: Any, target_spec: TargetSpec, *, max_attempts: 
         join_result = await ensure_join_if_needed(client, target_spec)
         if not join_result.ok:
             return ResolvedTarget(ok=False, peer=None, chat_id=None, method="ensure_join", error=join_result.reason)
+
+    resolved = _get_cached_resolution(target_spec)
+    if resolved:
+        return resolved
 
     resolved = await resolve_peer(client, target_spec, max_attempts=max_attempts)
     if resolved.ok:
@@ -312,6 +412,8 @@ async def resolve_entity(client: Any, target_spec: TargetSpec, *, max_attempts: 
             "session_name": getattr(client, "name", "client"),
         },
     )
+    if resolved.error in _FATAL_ERRORS:
+        _cache_resolution(target_spec, resolved, failure=True)
     return resolved
 
 
@@ -372,6 +474,39 @@ def _purge_cache() -> None:
             stale.append(key)
     for key in stale:
         _CACHE.pop(key, None)
+
+    stale_failures: list[str] = []
+    for key, (_, expires_at) in _FAILURE_CACHE.items():
+        if expires_at <= now:
+            stale_failures.append(key)
+    for key in stale_failures:
+        _FAILURE_CACHE.pop(key, None)
+
+
+def _cache_resolution(target_spec: TargetSpec, resolved: ResolvedTarget, *, failure: bool = False) -> None:
+    ttl = _FAILURE_TTL if failure else _CACHE_TTL
+    cache = _FAILURE_CACHE if failure else _CACHE
+    cache[target_spec.cache_key()] = (resolved, datetime.now(timezone.utc) + ttl)
+
+
+def _get_cached_resolution(target_spec: TargetSpec) -> ResolvedTarget | None:
+    _purge_cache()
+    key = target_spec.cache_key()
+    now = datetime.now(timezone.utc)
+    cached = _CACHE.get(key)
+    if cached:
+        resolved, expires_at = cached
+        if expires_at > now:
+            return resolved
+
+    failure_entry = _FAILURE_CACHE.get(key)
+    if failure_entry:
+        resolved, expires_at = failure_entry
+        if expires_at > now:
+            return resolved
+        _FAILURE_CACHE.pop(key, None)
+
+    return None
 
 
 def debug_resolve_targets(client: Any, targets: Iterable[str]) -> list[dict[str, Any]]:

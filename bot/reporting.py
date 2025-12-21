@@ -10,6 +10,7 @@ import config
 from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
 
+from bot.chat_access import resolve_chat_safe
 from bot.constants import DEFAULT_REPORTS
 from bot.dependencies import API_HASH, API_ID, data_store, ensure_pyrogram_creds
 from bot.state import reset_user_context
@@ -340,6 +341,19 @@ async def perform_reporting(
         async def report_once(client: Client) -> bool:
             nonlocal halted
             try:
+                chat, access_error = await resolve_chat_safe(client, resolved_chat_id, invite_link=target_spec.invite_link)
+                if chat is None:
+                    status = (access_error or {}).get("status")
+                    detail = (access_error or {}).get("detail")
+                    logging.info(
+                        "Skipping report for %s via %s due to access issue: %s (%s)",
+                        target,
+                        client.name,
+                        status,
+                        detail,
+                    )
+                    return False
+
                 return await report_profile_photo(client, resolved_chat_id, reason=reason_code, reason_text=reason_text)
             except FloodWait as fw:
                 wait_for = getattr(fw, "value", 1)

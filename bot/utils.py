@@ -14,7 +14,7 @@ from pyrogram.errors import (
 from pyrogram import Client
 
 from bot.dependencies import API_HASH, API_ID
-from bot.link_parser import maybe_parse_join_target
+from bot.link_parser import maybe_parse_join_target, parse_message_link
 
 
 def friendly_error(message: str) -> str:
@@ -39,36 +39,31 @@ def is_valid_link(text: str) -> bool:
 
 
 def parse_telegram_url(url: str) -> dict:
-    parsed = urlparse(url if url.startswith("http") else f"https://{url}")
-    path_parts = [p for p in parsed.path.split("/") if p]
+    try:
+        parsed_link = parse_message_link(url)
+        if parsed_link.type == "private_message":
+            return {
+                "type": "private_message",
+                "chat_id": parsed_link.chat_ref,
+                "message_id": parsed_link.message_id,
+                "internal_id": parsed_link.internal_id,
+            }
+        if parsed_link.type == "public_message":
+            return {
+                "type": "public_message",
+                "username": parsed_link.username,
+                "message_id": parsed_link.message_id,
+            }
+    except Exception:
+        parsed = urlparse(url if url.startswith("http") else f"https://{url}")
+        path_parts = [p for p in parsed.path.split("/") if p]
 
-    if not parsed.netloc.endswith("t.me") or not path_parts:
-        raise ValueError("Invalid Telegram URL")
-
-    if path_parts[0] == "c" and len(path_parts) >= 3:
-        if not path_parts[1].isdigit() or not path_parts[2].isdigit():
-            raise ValueError("Invalid private message link")
-        return {
-            "type": "private_message",
-            "chat_id": int(f"-100{path_parts[1]}"),
-            "message_id": int(path_parts[2]),
-        }
-
-    if len(path_parts) >= 3 and path_parts[1] in {"s", "story"}:
-        return {
-            "type": "story",
-            "username": path_parts[0],
-            "story_id": path_parts[2],
-        }
-
-    if len(path_parts) >= 2:
-        if not path_parts[1].isdigit():
-            raise ValueError("Invalid public message link")
-        return {
-            "type": "public_message",
-            "username": path_parts[0],
-            "message_id": int(path_parts[1]),
-        }
+        if len(path_parts) >= 3 and path_parts[1] in {"s", "story"}:
+            return {
+                "type": "story",
+                "username": path_parts[0],
+                "story_id": path_parts[2],
+            }
 
     parsed_join = maybe_parse_join_target(url)
     if parsed_join:

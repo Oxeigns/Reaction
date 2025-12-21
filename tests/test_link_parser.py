@@ -1,39 +1,40 @@
-import pytest
-
-from bot.link_parser import ParsedTelegramLink, maybe_parse_join_target, parse_join_target
+from bot.link_parser import normalize_url, parse_join_link, parse_message_link
 
 
-@pytest.mark.parametrize(
-    "text, expected_type, invite_hash, username",
-    [
-        ("https://t.me/+OJ_9RbucSzhjMGVl", "invite", "OJ_9RbucSzhjMGVl", None),
-        ("https://t.me/joinchat/OJ_9RbucSzhjMGVl", "invite", "OJ_9RbucSzhjMGVl", None),
-        ("tg://join?invite=OJ_9RbucSzhjMGVl", "invite", "OJ_9RbucSzhjMGVl", None),
-        ("+OJ_9RbucSzhjMGVl", "invite", "OJ_9RbucSzhjMGVl", None),
-        ("https://t.me/+abc123.", "invite", "abc123", None),
-        ("@publicchannel", "public", None, "publicchannel"),
-        ("https://t.me/channel_name", "public", None, "channel_name"),
-        ("t.me/channel_name/", "public", None, "channel_name"),
-        ("https://t.me/channel_name/12345", "public", None, "channel_name"),
-        ("channel_name", "public", None, "channel_name"),
-        ("tg://join?invite=hashvalue)", "invite", "hashvalue", None),
-        ("https://t.me/joinchat/hashvalue,", "invite", "hashvalue", None),
-    ],
-)
-def test_parse_join_target_variants(text, expected_type, invite_hash, username):
-    parsed = parse_join_target(text)
-    assert parsed.type == expected_type
-    assert parsed.invite_hash == invite_hash
-    assert parsed.username == username
-    assert parsed.normalized_url.startswith("https://t.me/")
+def test_normalize_removes_query_and_tg_resolve():
+    url = normalize_url("tg://resolve?domain=test&start=12&foo=bar")
+    assert url == "https://t.me/test/12"
 
 
-def test_invalid_link_returns_none():
-    assert maybe_parse_join_target("not a link") is None
-    assert maybe_parse_join_target("") is None
+def test_parse_join_invite_hash():
+    link = parse_join_link("https://t.me/+abcdef")
+    assert link
+    assert link.kind == "invite_hash"
+    assert link.value == "abcdef"
 
 
-def test_invite_normalization_strips_trailing_punctuation():
-    parsed = parse_join_target("https://t.me/+abc123,,,")
-    assert parsed.invite_hash == "abc123"
-    assert parsed.normalized_url == "https://t.me/+abc123"
+def test_parse_join_public_username():
+    link = parse_join_link("t.me/publicgroup")
+    assert link
+    assert link.kind == "public_username"
+    assert link.value == "publicgroup"
+
+
+def test_parse_message_public():
+    link = parse_message_link("https://t.me/example/123")
+    assert link
+    assert link.kind == "public_msg"
+    assert link.chat_ref == "example"
+    assert link.msg_id == 123
+
+
+def test_parse_message_private_c():
+    link = parse_message_link("t.me/c/123456/45")
+    assert link
+    assert link.kind == "private_c_msg"
+    assert link.chat_ref == -100123456
+    assert link.msg_id == 45
+
+
+def test_parse_message_rejects_profile():
+    assert parse_message_link("https://t.me/someuser") is None

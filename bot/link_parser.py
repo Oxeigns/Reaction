@@ -1,96 +1,122 @@
-"""Robust parsing of Telegram join and message links."""
 from __future__ import annotations
+
+"""Utilities for validating and normalizing Telegram links/usernames for joins."""
 
 import re
 from dataclasses import dataclass
-from typing import Optional
+from typing import Literal
 from urllib.parse import parse_qs, urlparse
 
-TELEGRAM_HOSTS = {"t.me", "telegram.me", "telegram.dog", "www.t.me", "www.telegram.me"}
+
+@dataclass(frozen=True)
+class ParsedTelegramLink:
+    type: Literal["invite", "public"]
+    normalized_url: str
+    invite_hash: str | None = None
+    username: str | None = None
 
 
-@dataclass
-class JoinLink:
-    kind: str  # public_username | invite_hash
-    value: str
-    raw: str
+_TRAILING_PUNCTUATION = ",.;)]}>'\""
 
 
-@dataclass
-class MessageLink:
-    kind: str  # public_msg | private_c_msg
-    chat_ref: str | int
-    msg_id: int
-    raw: str
+def _clean_input(text: str) -> str:
+    cleaned = (text or "").strip()
+    cleaned = cleaned.rstrip(_TRAILING_PUNCTUATION)
+    return cleaned
 
 
-def normalize_url(text: str) -> str:
-    cleaned = text.strip()
-    if cleaned.startswith("tg://resolve"):
-        parsed = urlparse(cleaned)
-        qs = parse_qs(parsed.query)
-        domain = qs.get("domain", [""])[0]
-        start = qs.get("start", [None])[0]
-        if domain:
-            cleaned = f"https://t.me/{domain}"
-            if start:
-                cleaned = f"{cleaned}/{start}"
-    if not re.match(r"^[a-z]+://", cleaned, re.I):
-        cleaned = "https://" + cleaned
-    parsed = urlparse(cleaned)
-    normalized = parsed._replace(query="", fragment="")
-    return normalized.geturl()
-
-
-def _match_host(parsed) -> bool:
-    return parsed.netloc.lower() in TELEGRAM_HOSTS
-
-
-def parse_join_link(text: str) -> Optional[JoinLink]:
-    url = normalize_url(text)
-    parsed = urlparse(url)
-    if not _match_host(parsed):
-        return None
-    parts = [p for p in parsed.path.split("/") if p]
-    if not parts:
-        return None
-
-    if parts[0].startswith("+"):
-        return JoinLink("invite_hash", parts[0].lstrip("+"), raw=url)
-    if parts[0].lower() == "joinchat" and len(parts) >= 2:
-        return JoinLink("invite_hash", parts[1], raw=url)
-
-    # Public username join
-    if len(parts) == 1 and re.match(r"^[A-Za-z0-9_]{5,}$", parts[0]):
-        return JoinLink("public_username", parts[0], raw=url)
+def _parse_invite_hash_from_url(parsed) -> str | None:
+    path_parts = [p for p in parsed.path.split("/") if p]
+    if parsed.scheme == "tg" and parsed.netloc.startswith("join"):
+        invite = parse_qs(parsed.query).get("invite")
+        if invite and invite[0]:
+            return invite[0]
+    if path_parts:
+        first = path_parts[0]
+        if first.startswith("+"):
+            return first.lstrip("+") or None
+        if first.lower() == "joinchat" and len(path_parts) >= 2:
+            return path_parts[1] or None
     return None
 
 
-def parse_message_link(text: str) -> Optional[MessageLink]:
-    url = normalize_url(text)
-    parsed = urlparse(url)
-    if not _match_host(parsed):
+def parse_join_target(raw: str) -> ParsedTelegramLink:
+    """Parse a user supplied link/username into a joinable target.
+
+    Accepted inputs:
+    - https://t.me/+hash
+    - https://t.me/joinchat/hash
+    - tg://join?invite=hash
+    - +hash (invite hash)
+    - @username, username, https://t.me/username
+    - Message links (https://t.me/username/123) are treated as public usernames
+    """
+
+    cleaned = _clean_input(raw)
+    if not cleaned:
+        raise ValueError("Empty link or username")
+    if " " in cleaned:
+        raise ValueError("Usernames or invites cannot contain spaces")
+
+    if cleaned.startswith("+"):
+        invite_hash = cleaned.lstrip("+")
+        if not invite_hash:
+            raise ValueError("Invite hash is missing")
+        return ParsedTelegramLink(
+            type="invite",
+            normalized_url=f"https://t.me/+{invite_hash}",
+            invite_hash=invite_hash,
+        )
+
+    if cleaned.startswith("@"):
+        username = cleaned.lstrip("@")
+        if not username:
+            raise ValueError("Username is missing")
+        return ParsedTelegramLink(
+            type="public",
+            normalized_url=f"https://t.me/{username}",
+            username=username,
+        )
+
+    parsed = urlparse(cleaned if cleaned.startswith("http") or cleaned.startswith("tg") else f"https://{cleaned}")
+    invite_hash = _parse_invite_hash_from_url(parsed)
+    if invite_hash:
+        return ParsedTelegramLink(
+            type="invite",
+            normalized_url=f"https://t.me/+{invite_hash}",
+            invite_hash=invite_hash,
+        )
+
+    if parsed.netloc and parsed.netloc.endswith("t.me"):
+        path_parts = [p for p in parsed.path.split("/") if p]
+        if not path_parts:
+            raise ValueError("The t.me link is missing a username")
+        username = path_parts[0].lstrip("@")
+        if not username:
+            raise ValueError("Username is missing")
+        # Allow message/story suffixes; we only care about the username for joins
+        username = re.sub(r"[^A-Za-z0-9_]+$", "", username)
+        return ParsedTelegramLink(
+            type="public",
+            normalized_url=f"https://t.me/{username}",
+            username=username,
+        )
+
+    if cleaned:
+        return ParsedTelegramLink(
+            type="public",
+            normalized_url=f"https://t.me/{cleaned.lstrip('@')}",
+            username=cleaned.lstrip("@"),
+        )
+
+    raise ValueError("Unsupported link or username")
+
+
+def maybe_parse_join_target(raw: str) -> ParsedTelegramLink | None:
+    try:
+        return parse_join_target(raw)
+    except Exception:
         return None
-    parts = [p for p in parsed.path.split("/") if p]
-    if len(parts) < 2:
-        return None
-
-    # Private/supergroup messages t.me/c/<internal>/<msg>
-    if parts[0] == "c" and len(parts) >= 3 and parts[1].isdigit() and parts[2].isdigit():
-        chat_id = int(f"-100{parts[1]}")
-        return MessageLink("private_c_msg", chat_id, int(parts[2]), raw=url)
-
-    # Public message link
-    if re.match(r"^[A-Za-z0-9_]{5,}$", parts[0]) and parts[1].isdigit():
-        return MessageLink("public_msg", parts[0], int(parts[1]), raw=url)
-
-    return None
 
 
-__all__ = [
-    "JoinLink",
-    "MessageLink",
-    "normalize_url",
-    "parse_join_link",
-    "parse_message_link",
-]
+__all__ = ["ParsedTelegramLink", "parse_join_target", "maybe_parse_join_target"]

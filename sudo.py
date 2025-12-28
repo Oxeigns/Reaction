@@ -87,15 +87,15 @@ def remove_sudo_user(user_id: int) -> bool:
     return True
 
 
-def _unauthorized_reply(update: Update) -> None:
+async def _unauthorized_reply(update: Update) -> None:
     if update.callback_query:
         try:
-            update.callback_query.answer(UNAUTHORIZED_MESSAGE, show_alert=True)
+            await update.callback_query.answer(UNAUTHORIZED_MESSAGE, show_alert=True)
         except Exception:
             pass
     if update.effective_message:
         try:
-            update.effective_message.reply_text(UNAUTHORIZED_MESSAGE)
+            await update.effective_message.reply_text(UNAUTHORIZED_MESSAGE)
         except Exception:
             pass
 
@@ -105,7 +105,7 @@ def require_owner(func: Callable) -> Callable:
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         user_id = update.effective_user.id if update.effective_user else None
         if not is_owner(user_id):
-            _unauthorized_reply(update)
+            await _unauthorized_reply(update)
             return
         return await func(update, context, *args, **kwargs)
 
@@ -117,7 +117,7 @@ async def auth_guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if is_sudo(user_id):
         return
 
-    _unauthorized_reply(update)
+    await _unauthorized_reply(update)
     raise ApplicationHandlerStop
 
 

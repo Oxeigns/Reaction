@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import random
@@ -34,6 +35,7 @@ from bot.constants import (
     REPORT_URLS,
     REASON_LABELS,
     SESSION_MODE,
+    SESSION_PICK,
     STORY_URL,
     TARGET_KIND,
 )
@@ -53,10 +55,17 @@ from bot.state import (
     active_session_count,
     clear_report_state,
     flow_state,
+    get_session_order,
+    manage_selection,
+    pop_view,
     profile_state,
+    report_selection,
     reset_flow_state,
     reset_user_context,
     saved_session_count,
+    set_session_order,
+    set_view,
+    ui_state,
 )
 from bot.ui import (
     add_restart_button,
@@ -90,6 +99,26 @@ HELP_MESSAGE = (
 )
 
 
+def _main_menu_markup(context: ContextTypes.DEFAULT_TYPE) -> InlineKeyboardMarkup:
+    profile = profile_state(context)
+    saved = len(profile.get("saved_sessions", []))
+    return main_menu_keyboard(saved, active_session_count(context))
+
+
+async def _render_saved_summary(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, *, remember_view: bool = True
+) -> None:
+    saved = len(await data_store.get_sessions())
+    profile_state(context)["saved_sessions"] = await data_store.get_sessions()
+    if remember_view:
+        set_view(context, "saved_summary")
+    await _notify_user(
+        update,
+        f"Saved sessions: {saved}",
+        reply_markup=_stacked_markup([[InlineKeyboardButton("⬅️ Back", callback_data="saved:back")]]),
+    )
+
+
 async def safe_edit_message(query, text: str, *, reply_markup=None, parse_mode=None, **kwargs):
     current = query.message
     html_text = getattr(current, "text_html", None)
@@ -109,6 +138,157 @@ async def safe_edit_message(query, text: str, *, reply_markup=None, parse_mode=N
         if "Message is not modified" in str(exc):
             return current
         raise
+
+
+def _stacked_markup(rows: list[list[InlineKeyboardButton]]) -> InlineKeyboardMarkup:
+    ordered_rows = [list(row) for row in rows]
+    ordered_rows.append([InlineKeyboardButton("🔄 Restart", callback_data="restart")])
+    return InlineKeyboardMarkup(ordered_rows)
+
+
+async def _fetch_session_profile(session: str, api_id: int | None, api_hash: str | None) -> dict:
+    if not (api_id and api_hash):
+        return {}
+
+    from pyrogram import Client
+
+    client = Client(
+        name=f"profile_{abs(hash(session)) % 10_000}",
+        api_id=api_id,
+        api_hash=api_hash,
+        session_string=session,
+        workdir=f"/tmp/profile_{abs(hash(session)) % 10_000}",
+    )
+    try:
+        await client.start()
+        me = await client.get_me()
+        return {
+            "id": getattr(me, "id", None),
+            "first_name": getattr(me, "first_name", None),
+            "last_name": getattr(me, "last_name", None),
+            "username": getattr(me, "username", None),
+            "phone_number": getattr(me, "phone_number", None),
+        }
+    except Exception:
+        logging.debug("Unable to fetch session profile for display", exc_info=True)
+        return {}
+    finally:
+        with contextlib.suppress(Exception):
+            await client.stop()
+
+
+async def _hydrate_session_profiles(context: ContextTypes.DEFAULT_TYPE, sessions: list[str]) -> dict[str, dict]:
+    profile = profile_state(context)
+    cache = profile.setdefault("session_profiles", {})
+    missing = [session for session in sessions if session not in cache]
+
+    api_id = flow_state(context).get("api_id") or profile.get("api_id") or config.API_ID
+    api_hash = flow_state(context).get("api_hash") or profile.get("api_hash") or config.API_HASH
+
+    for session in missing:
+        cache[session] = await _fetch_session_profile(session, api_id, api_hash)
+
+    return {session: cache.get(session, {}) for session in sessions}
+
+
+def _format_session_label(meta: dict, index: int) -> str:
+    name_parts = [meta.get("first_name"), meta.get("last_name")]
+    name = " ".join(filter(None, name_parts)).strip()
+    if not name:
+        name = meta.get("username") or f"Session {index + 1}"
+
+    user_id = meta.get("id")
+    phone = meta.get("phone_number") or "Unknown"
+    username = meta.get("username")
+
+    line = f"{name}{f' ({user_id})' if user_id else ''} • 📞 {phone}"
+    if username:
+        line = f"{line} • @{username}"
+    return line
+
+
+async def _build_session_rows(context: ContextTypes.DEFAULT_TYPE, sessions: list[str]) -> list[str]:
+    profiles = await _hydrate_session_profiles(context, sessions)
+    return [_format_session_label(profiles.get(session, {}), idx) for idx, session in enumerate(sessions)]
+
+
+async def _render_manage_sessions(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    status_line: str | None = None,
+    remember_view: bool = True,
+) -> None:
+    sessions = await data_store.get_sessions()
+    profile_state(context)["saved_sessions"] = list(sessions)
+
+    if remember_view:
+        set_view(context, "manage_sessions")
+
+    selection = manage_selection(context)
+    selection.intersection_update(sessions)
+    set_session_order(context, "manage", sessions)
+
+    buttons: list[list[InlineKeyboardButton]] = []
+    if sessions:
+        rows = await _build_session_rows(context, sessions)
+        for idx, label in enumerate(rows):
+            prefix = "✅" if sessions[idx] in selection else "⬜"
+            buttons.append(
+                [InlineKeyboardButton(f"{prefix} {label}", callback_data=f"manage:toggle:{idx}")]
+            )
+
+    buttons.append([InlineKeyboardButton("🗑 Remove Selected", callback_data="manage:remove")])
+    buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="manage:back")])
+
+    lines = ["Manage Sessions", f"Total saved: {len(sessions)}"]
+    if status_line:
+        lines.append(status_line)
+    lines.append("Toggle sessions below to select them for removal.")
+    if not sessions:
+        lines.append("No saved sessions available.")
+
+    await _notify_user(update, "\n".join(lines), reply_markup=_stacked_markup(buttons))
+
+
+async def _render_session_picker(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    sessions: list[str],
+    *,
+    remember_view: bool = True,
+    message_prefix: str | None = None,
+) -> None:
+    if remember_view:
+        set_view(context, "session_picker")
+
+    selection = report_selection(context)
+    if not selection:
+        selection.update(sessions)
+    else:
+        selection.intersection_update(sessions)
+
+    set_session_order(context, "report", sessions)
+    rows = await _build_session_rows(context, sessions)
+
+    buttons: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(
+                f"{'✅' if session in selection else '⬜'} {rows[idx]}",
+                callback_data=f"session_select:toggle:{idx}",
+            )
+        ]
+        for idx, session in enumerate(sessions)
+    ]
+
+    buttons.append([InlineKeyboardButton("Done ☑️", callback_data="session_select:done")])
+    buttons.append([InlineKeyboardButton("⬅️ Back", callback_data="session_select:back")])
+    buttons.append([InlineKeyboardButton("✖️ Cancel", callback_data="nav:cancel")])
+
+    text = message_prefix or "Total sessions available: {count}".format(count=len(sessions))
+    text = f"{text}\nSelect the sessions to use, then tap Done ☑️."
+
+    await _notify_user(update, text, reply_markup=_stacked_markup(buttons))
 
 
 def _format_sessions_for_copy(sessions: list[str], *, max_items: int = 10) -> str:
@@ -652,16 +832,7 @@ async def _resolve_and_preview_target(update: Update, context: ContextTypes.DEFA
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     reset_user_context(context, update.effective_user.id if update.effective_user else None)
-    profile = profile_state(context)
-    profile["saved_sessions"] = await data_store.get_sessions()
-
-    greeting = render_greeting()
-
-    await update.effective_message.reply_text(
-        f"<pre>{greeting}</pre>",
-        parse_mode=ParseMode.HTML,
-        reply_markup=main_menu_keyboard(len(profile["saved_sessions"]), active_session_count(context)),
-    )
+    await _send_restart_menu(update, context)
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -718,7 +889,9 @@ async def _send_restart_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
     profile = profile_state(context)
     profile["saved_sessions"] = await data_store.get_sessions()
     greeting = render_greeting()
-    markup = main_menu_keyboard(len(profile.get("saved_sessions", [])), active_session_count(context))
+    ui_state(context)["history"] = []
+    set_view(context, "main_menu", replace=True)
+    markup = _main_menu_markup(context)
 
     if update.callback_query:
         query = update.callback_query
@@ -769,12 +942,7 @@ def _reason_label(reason_code: int | None) -> str:
 
 
 async def show_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    saved = len(await data_store.get_sessions())
-    active = active_session_count(context)
-    await update.effective_message.reply_text(
-        f"Saved sessions: {saved}\nCurrently loaded for this chat: {active}",
-        reply_markup=main_menu_keyboard(saved, active),
-    )
+    await _render_saved_summary(update, context)
 
 
 async def handle_action_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -794,14 +962,28 @@ async def handle_action_buttons(update: Update, context: ContextTypes.DEFAULT_TY
         )
         return ConversationHandler.END
     if query.data == "action:sessions":
-        saved = len(await data_store.get_sessions())
-        active = active_session_count(context)
-        await safe_edit_message(
-            query,
-            f"Saved sessions: {saved}\nCurrently loaded for this chat: {active}",
-            reply_markup=main_menu_keyboard(saved, active),
-        )
+        await _render_saved_summary(update, context)
         return ConversationHandler.END
+    return ConversationHandler.END
+
+
+async def handle_saved_navigation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    previous = pop_view(context) or "main_menu"
+    if previous == "saved_summary":
+        previous = pop_view(context) or "main_menu"
+
+    if previous == "main_menu":
+        await _send_restart_menu(update, context)
+        return ConversationHandler.END
+
+    if previous == "manage_sessions":
+        await _render_manage_sessions(update, context, remember_view=False)
+        return ConversationHandler.END
+
+    await _send_restart_menu(update, context)
     return ConversationHandler.END
 
 
@@ -874,7 +1056,75 @@ async def handle_report_again(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def handle_status_chip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
+    await query.answer()
+
+    _, status = query.data.split(":", maxsplit=1)
+    if status == "saved":
+        await _render_manage_sessions(update, context)
+        return
+
+    if status == "active":
+        await query.answer("Loaded sessions shown above.", show_alert=False)
+        return
+
     await query.answer("Live status indicators — you are already in the dark UI.", show_alert=False)
+
+
+async def handle_manage_sessions_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    parts = query.data.split(":")
+    action = parts[1] if len(parts) > 1 else ""
+    sessions = get_session_order(context, "manage")
+    selection = manage_selection(context)
+
+    if action == "toggle":
+        try:
+            index = int(parts[2])
+        except (IndexError, ValueError):
+            await query.answer("Unable to toggle this session.", show_alert=True)
+            return ConversationHandler.END
+
+        if index < 0 or index >= len(sessions):
+            await query.answer("Unknown session.", show_alert=True)
+            return ConversationHandler.END
+
+        session_value = sessions[index]
+        if session_value in selection:
+            selection.discard(session_value)
+        else:
+            selection.add(session_value)
+
+        await _render_manage_sessions(update, context, remember_view=False)
+        return ConversationHandler.END
+
+    if action == "remove":
+        targets = [session for session in selection if session in sessions]
+        if not targets:
+            await query.answer("Select at least one session to remove.", show_alert=True)
+            return ConversationHandler.END
+
+        removed = await data_store.remove_sessions(targets)
+        selection.difference_update(targets)
+        await _render_manage_sessions(
+            update,
+            context,
+            status_line=f"Removed {removed} session(s)." if removed else "No sessions removed.",
+            remember_view=False,
+        )
+        return ConversationHandler.END
+
+    if action == "back":
+        previous = pop_view(context) or "main_menu"
+        if previous == "saved_summary":
+            await _render_saved_summary(update, context)
+            return ConversationHandler.END
+
+        await _send_restart_menu(update, context)
+        return ConversationHandler.END
+
+    return ConversationHandler.END
 
 
 async def handle_session_mode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -900,28 +1150,14 @@ async def handle_session_mode(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
             return ConversationHandler.END
 
-        flow["sessions"] = list(saved_sessions)
-        valid_sessions = await _validate_sessions_with_feedback(
+        report_selection(context).clear()
+        await _render_session_picker(
             update,
             context,
-            flow["sessions"],
-            api_id=flow.get("api_id") or profile.get("api_id") or config.API_ID,
-            api_hash=flow.get("api_hash") or profile.get("api_hash") or config.API_HASH,
-            fallback_markup=main_menu_keyboard(len(saved_sessions), active_session_count(context)),
+            list(saved_sessions),
+            message_prefix=f"Total sessions available: {len(saved_sessions)}",
         )
-        if not valid_sessions:
-            return ConversationHandler.END
-
-        flow["sessions"] = valid_sessions
-        profile["saved_sessions"] = list(valid_sessions)
-        session_preview = _format_sessions_for_copy(valid_sessions)
-        await safe_edit_message(
-            query,
-            f"Using your saved sessions:\n\n{session_preview}\n\nWhat are you reporting?",
-            reply_markup=target_kind_keyboard(),
-            parse_mode=ParseMode.HTML,
-        )
-        return TARGET_KIND
+        return SESSION_PICK
 
     flow["sessions"] = []
     await safe_edit_message(
@@ -929,6 +1165,80 @@ async def handle_session_mode(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"Send between {MIN_SESSIONS} and {MAX_SESSIONS} Pyrogram session strings (one per line).",
     )
     return REPORT_SESSIONS
+
+
+async def handle_session_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    sessions = get_session_order(context, "report")
+    selection = report_selection(context)
+    action = query.data.split(":", maxsplit=2)[1]
+
+    if not sessions:
+        await _send_restart_menu(update, context)
+        return ConversationHandler.END
+
+    if action == "toggle":
+        try:
+            index = int(query.data.split(":", maxsplit=2)[2])
+        except (IndexError, ValueError):
+            await query.answer("Unable to toggle this session.", show_alert=True)
+            return SESSION_PICK
+
+        if index >= len(sessions) or index < 0:
+            await query.answer("Unknown session.", show_alert=True)
+            return SESSION_PICK
+
+        session_value = sessions[index]
+        if session_value in selection:
+            selection.discard(session_value)
+        else:
+            selection.add(session_value)
+
+        await _render_session_picker(update, context, sessions, remember_view=False)
+        return SESSION_PICK
+
+    if action == "back":
+        prompt = context.user_data.get("session_mode_prompt") or "Select a session mode to continue."
+        set_view(context, "session_mode", replace=True)
+        await safe_edit_message(query, prompt, reply_markup=session_mode_keyboard())
+        return SESSION_MODE
+
+    if action == "done":
+        ordered_selection = [session for session in sessions if session in selection]
+        if not ordered_selection:
+            await query.answer("Select at least one session.", show_alert=True)
+            return SESSION_PICK
+
+        flow = flow_state(context)
+        profile = profile_state(context)
+        valid_sessions = await _validate_sessions_with_feedback(
+            update,
+            context,
+            ordered_selection,
+            api_id=flow.get("api_id") or profile.get("api_id") or config.API_ID,
+            api_hash=flow.get("api_hash") or profile.get("api_hash") or config.API_HASH,
+            fallback_markup=_main_menu_markup(context),
+        )
+
+        if not valid_sessions:
+            return ConversationHandler.END
+
+        flow["sessions"] = valid_sessions
+        selection.intersection_update(valid_sessions)
+        profile["saved_sessions"] = await data_store.get_sessions()
+        session_preview = _format_sessions_for_copy(valid_sessions)
+        set_view(context, "target_kind", replace=True)
+        await safe_edit_message(
+            query,
+            f"Selected {len(valid_sessions)} session(s).\n\n{session_preview}\n\nWhat are you reporting?",
+            reply_markup=target_kind_keyboard(),
+            parse_mode=ParseMode.HTML,
+        )
+        return TARGET_KIND
+
+    return ConversationHandler.END
 
 
 async def start_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -945,8 +1255,11 @@ async def start_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         flow["api_hash"] = saved_api_hash
         profile["api_id"] = saved_api_id
         profile["api_hash"] = saved_api_hash
+        prompt = "Using your saved API credentials. Select a session mode to continue."
+        context.user_data["session_mode_prompt"] = prompt
+        set_view(context, "session_mode")
         await update.effective_message.reply_text(
-            "Using your saved API credentials. Select a session mode to continue.",
+            prompt,
             reply_markup=session_mode_keyboard(),
         )
         return SESSION_MODE
@@ -997,28 +1310,14 @@ async def handle_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             )
             return ConversationHandler.END
 
-        flow = flow_state(context)
-        flow["sessions"] = list(saved_sessions)
-
-        valid_sessions = await _validate_sessions_with_feedback(
+        report_selection(context).clear()
+        await _render_session_picker(
             update,
             context,
-            flow["sessions"],
-            api_id=flow.get("api_id") or profile.get("api_id") or config.API_ID,
-            api_hash=flow.get("api_hash") or profile.get("api_hash") or config.API_HASH,
-            fallback_markup=main_menu_keyboard(len(saved_sessions), active_session_count(context)),
+            list(saved_sessions),
+            message_prefix=f"Total sessions available: {len(saved_sessions)}",
         )
-        if not valid_sessions:
-            return ConversationHandler.END
-
-        flow["sessions"] = valid_sessions
-        session_preview = _format_sessions_for_copy(valid_sessions)
-        await update.effective_message.reply_text(
-            f"Using your saved sessions:\n\n{session_preview}\n\nWhat are you reporting?",
-            reply_markup=target_kind_keyboard(),
-            parse_mode=ParseMode.HTML,
-        )
-        return TARGET_KIND
+        return SESSION_PICK
 
     sessions = session_strings_from_text(raw_text)
     if not (MIN_SESSIONS <= len(sessions) <= MAX_SESSIONS):
@@ -1310,8 +1609,11 @@ __all__ = [
     "help_command",
     "show_sessions",
     "handle_action_buttons",
+    "handle_saved_navigation",
     "handle_status_chip",
+    "handle_manage_sessions_action",
     "handle_session_mode",
+    "handle_session_selection",
     "handle_report_again",
     "start_report",
     "handle_api_id",

@@ -29,6 +29,7 @@ from bot.constants import (
     REPORT_MESSAGE,
     REPORT_REASON_TYPE,
     REPORT_SESSIONS,
+    SESSION_PICK,
     REPORT_URLS,
     SESSION_MODE,
     STORY_URL,
@@ -52,8 +53,11 @@ from bot.handlers import (
     handle_report_again,
     handle_report_count,
     handle_report_urls,
+    handle_manage_sessions_action,
+    handle_session_selection,
     handle_session_mode,
     handle_sessions,
+    handle_saved_navigation,
     handle_status_chip,
     handle_story_url,
     handle_target_kind,
@@ -107,6 +111,7 @@ def build_app() -> Application:
             API_HASH_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_api_hash), nav_handler],
             REPORT_SESSIONS: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_sessions), nav_handler],
             SESSION_MODE: [CallbackQueryHandler(handle_session_mode, pattern=r"^session_mode:"), nav_handler],
+            SESSION_PICK: [CallbackQueryHandler(handle_session_selection, pattern=r"^session_select:"), nav_handler],
             TARGET_KIND: [CallbackQueryHandler(handle_target_kind, pattern=r"^kind:"), nav_handler],
             REPORT_URLS: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_report_urls), nav_handler],
             PRIVATE_INVITE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_private_invite), nav_handler],
@@ -150,7 +155,10 @@ def build_app() -> Application:
     application.add_handler(add_sessions_conv)
     application.add_handler(report_conversation)
     application.add_handler(CallbackQueryHandler(restart_callback, pattern=r"^restart$"))
+    application.add_handler(CallbackQueryHandler(handle_manage_sessions_action, pattern=r"^manage:"))
+    application.add_handler(CallbackQueryHandler(handle_saved_navigation, pattern=r"^saved:"))
     application.add_handler(CallbackQueryHandler(handle_session_mode, pattern=r"^session_mode:"), group=1)
+    application.add_handler(CallbackQueryHandler(handle_session_selection, pattern=r"^session_select:"), group=1)
     application.add_handler(CallbackQueryHandler(handle_status_chip, pattern=r"^status:"))
     application.add_handler(CallbackQueryHandler(handle_confirmation, pattern=r"^confirm:"))
 

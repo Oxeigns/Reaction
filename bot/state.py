@@ -32,6 +32,7 @@ def reset_user_context(context: ContextTypes.DEFAULT_TYPE, user_id: int | None =
         task.cancel()
 
     clear_report_state(context)
+    context.user_data.pop("ui_state", None)
 
 
 def saved_session_count(context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -41,6 +42,49 @@ def saved_session_count(context: ContextTypes.DEFAULT_TYPE) -> int:
 def active_session_count(context: ContextTypes.DEFAULT_TYPE) -> int:
     return len(flow_state(context).get("sessions", []))
 
+
+def ui_state(context: ContextTypes.DEFAULT_TYPE) -> dict:
+    return context.user_data.setdefault("ui_state", {"history": []})
+
+
+def set_view(context: ContextTypes.DEFAULT_TYPE, view: str, *, replace: bool = False) -> None:
+    state = ui_state(context)
+    if replace:
+        state["current_view"] = view
+        return
+
+    current = state.get("current_view")
+    if current:
+        state.setdefault("history", []).append(current)
+    state["current_view"] = view
+
+
+def pop_view(context: ContextTypes.DEFAULT_TYPE) -> str | None:
+    state = ui_state(context)
+    history = state.get("history") or []
+    if not history:
+        return None
+
+    previous = history.pop()
+    state["current_view"] = previous
+    return previous
+
+
+def manage_selection(context: ContextTypes.DEFAULT_TYPE) -> set:
+    return ui_state(context).setdefault("manage_selection", set())
+
+
+def report_selection(context: ContextTypes.DEFAULT_TYPE) -> set:
+    return ui_state(context).setdefault("report_selection", set())
+
+
+def set_session_order(context: ContextTypes.DEFAULT_TYPE, key: str, sessions: list[str]) -> None:
+    ui_state(context)[f"{key}_order"] = list(sessions)
+
+
+def get_session_order(context: ContextTypes.DEFAULT_TYPE, key: str) -> list[str]:
+    return list(ui_state(context).get(f"{key}_order", []))
+
 __all__ = [
     "profile_state",
     "flow_state",
@@ -49,4 +93,11 @@ __all__ = [
     "reset_user_context",
     "saved_session_count",
     "active_session_count",
+    "ui_state",
+    "set_view",
+    "pop_view",
+    "manage_selection",
+    "report_selection",
+    "set_session_order",
+    "get_session_order",
 ]

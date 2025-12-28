@@ -120,7 +120,7 @@ def main_menu_keyboard(
         InlineKeyboardButton("ℹ️ Help", callback_data="action:help"),
         InlineKeyboardButton(f"🟢 Status: {live_status}", callback_data="status:live"),
         InlineKeyboardButton(f"🎯 Loaded: {active_sessions}", callback_data="status:active"),
-        InlineKeyboardButton(f"📦 Saved: {saved_sessions}", callback_data="status:saved"),
+        InlineKeyboardButton("📦 Manage Sessions", callback_data="status:saved"),
     ]
 
     return _with_restart_row(buttons)

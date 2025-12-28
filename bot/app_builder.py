@@ -36,6 +36,7 @@ from bot.constants import (
     TARGET_KIND,
 )
 from bot.dependencies import ensure_token
+from sudo import addsudo_command, auth_guard, rmsudo_command, sudolist_command
 from bot.handlers import (
     cancel,
     error_handler,
@@ -146,11 +147,16 @@ def build_app() -> Application:
         per_user=True,
     )
 
+    application.add_handler(MessageHandler(filters.ALL, auth_guard), group=-1)
+    application.add_handler(CallbackQueryHandler(auth_guard), group=-1)
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("uptime", uptime_command))
     application.add_handler(CommandHandler("ping", ping_command))
     application.add_handler(CommandHandler("restart", restart_command))
+    application.add_handler(CommandHandler("addsudo", addsudo_command))
+    application.add_handler(CommandHandler("rmsudo", rmsudo_command))
+    application.add_handler(CommandHandler("sudolist", sudolist_command))
     application.add_handler(CommandHandler("sessions", show_sessions))
     application.add_handler(add_sessions_conv)
     application.add_handler(report_conversation)

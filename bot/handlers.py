@@ -86,6 +86,7 @@ from bot.utils import (
     session_strings_from_text,
     validate_sessions,
 )
+from sudo import is_owner
 
 HELP_MESSAGE = (
     "ℹ️ *How to use the reporter*\n"
@@ -117,6 +118,29 @@ async def _render_saved_summary(
         f"Saved sessions: {saved}",
         reply_markup=_stacked_markup([[InlineKeyboardButton("⬅️ Back", callback_data="saved:back")]]),
     )
+
+
+async def _remove_owner_welcome_after_delay(message, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await asyncio.sleep(20)
+    try:
+        await context.bot.delete_message(chat_id=message.chat_id, message_id=message.message_id)
+    except BadRequest:
+        with contextlib.suppress(Exception):
+            await message.edit_text("Welcome message expired.")
+    except Exception:
+        with contextlib.suppress(Exception):
+            await message.delete()
+
+
+async def _send_owner_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    help_lines = [
+        "Welcome, you are owner of this bot.",
+        "/addsudo <numeric_id> <username>",
+        "/rmsudo <numeric_id> <username>",
+        "/sudolist",
+    ]
+    message = await update.effective_message.reply_text("\n".join(help_lines))
+    context.application.create_task(_remove_owner_welcome_after_delay(message, context))
 
 
 async def safe_edit_message(query, text: str, *, reply_markup=None, parse_mode=None, **kwargs):
@@ -832,6 +856,8 @@ async def _resolve_and_preview_target(update: Update, context: ContextTypes.DEFA
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     reset_user_context(context, update.effective_user.id if update.effective_user else None)
+    if update.effective_user and is_owner(update.effective_user.id):
+        await _send_owner_welcome(update, context)
     await _send_restart_menu(update, context)
 
 

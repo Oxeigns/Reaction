@@ -8,8 +8,10 @@ from typing import Iterable
 
 try:  # pragma: no cover - optional dependency
     import motor.motor_asyncio as motor_asyncio
-except Exception:  # pragma: no cover - defensive fallback
+    _motor_import_error = None
+except Exception as exc:  # pragma: no cover - defensive fallback
     motor_asyncio = None
+    _motor_import_error = exc
 
 
 class DataStore:
@@ -33,9 +35,9 @@ class DataStore:
         self.db = None
         if self.mongo_uri:
             if motor_asyncio is None:
-                logging.warning(
+                raise RuntimeError(
                     "MongoDB URI provided but Motor is unavailable; install 'motor' to enable persistence. "
-                    "Using in-memory storage.",
+                    f"Import error: {_motor_import_error}"
                 )
             else:
                 try:

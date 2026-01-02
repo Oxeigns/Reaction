@@ -1,88 +1,116 @@
 #!/usr/bin/env python3
-"""Telegram reporting bot entrypoint.
-
-This module initializes logging, validates configuration integrity, and wires the
-Telegram application together. The previous monolithic implementation has been
-split into focused modules under ``bot/`` for clarity and testability.
-"""
 from __future__ import annotations
+
+"""Minimal Telegram bot entrypoint for concurrent MTProto reporting."""
 
 import asyncio
 import logging
-import os
-import signal
-import sys
+import time
+from typing import Dict
+
+from pyrogram import Client, filters
+from pyrogram.types import Message
 
 import config
-from bot.app_builder import build_app, run_polling
-from bot.dependencies import get_data_store, verify_author_integrity
-from bot.logging_utils import build_logger
-from bot.scheduler import SchedulerManager, log_heartbeat
+from reporter import report_user
+from session_manager import build_clients, scan_session_files
+
+BOT_NAME = "reaction_reporter_bot"
+MAX_REPORTS = 5000
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
 
 
-def _setup_signal_handlers(loop: asyncio.AbstractEventLoop, shutdown_event: asyncio.Event) -> None:
-    """Register SIGTERM/SIGINT handlers to trigger graceful shutdown."""
+class BotState:
+    def __init__(self) -> None:
+        self.awaiting_username: Dict[int, bool] = {}
 
-    def _signal_handler(signame: str) -> None:
-        logging.info("Received %s; shutting down gracefully.", signame)
-        shutdown_event.set()
+    def set_waiting(self, user_id: int, waiting: bool) -> None:
+        self.awaiting_username[user_id] = waiting
 
-    for signame in ("SIGTERM", "SIGINT"):
-        try:
-            loop.add_signal_handler(getattr(signal, signame), lambda s=signame: _signal_handler(s))
-        except NotImplementedError:
-            # add_signal_handler isn't available on Windows event loops.
-            signal.signal(getattr(signal, signame), lambda *_: shutdown_event.set())
+    def is_waiting(self, user_id: int) -> bool:
+        return self.awaiting_username.get(user_id, False)
 
 
-def _restart_process() -> None:
-    logging.info("Restart requested; re-executing process with same args.")
-    os.execv(sys.executable, [sys.executable] + sys.argv)
+state = BotState()
 
 
-async def main_async() -> None:
-    """Entrypoint used by asyncio.run."""
-
-    verify_author_integrity(config.AUTHOR_NAME, config.AUTHOR_HASH)
-    build_logger()
-
-    store = get_data_store()
-
-    if store.is_persistent:
-        logging.info("MongoDB persistence enabled; sessions and reports will survive dyno restarts.")
-    else:
-        logging.info(
-            "Using in-memory storage; set the MONGO_URI environment variable to persist sessions and reports.")
-
-    app = build_app()
-    shutdown_event = asyncio.Event()
-
-    app.bot_data["shutdown_event"] = shutdown_event
-    app.bot_data.setdefault("restart_requested", False)
-
-    loop = asyncio.get_running_loop()
-    SchedulerManager.set_event_loop(loop)
-    SchedulerManager.ensure_job("heartbeat", log_heartbeat, trigger="interval", seconds=300)
-    _setup_signal_handlers(loop, shutdown_event)
-
-    try:
-        await run_polling(app, shutdown_event)
-    finally:
-        SchedulerManager.shutdown()
-        await store.close()
-
-    if app.bot_data.get("restart_requested"):
-        _restart_process()
+def is_authorized(message: Message) -> bool:
+    if not config.ADMIN_IDS:
+        return True
+    return message.from_user and message.from_user.id in config.ADMIN_IDS
 
 
-def main() -> None:
-    # asyncio.run owns the single event loop for the process; avoid creating or
-    # closing additional loops elsewhere to keep startup/shutdown predictable.
-    asyncio.run(main_async())
+app = Client(
+    BOT_NAME,
+    api_id=config.API_ID,
+    api_hash=config.API_HASH,
+    bot_token=config.BOT_TOKEN,
+    in_memory=True,
+)
+
+
+@app.on_message(filters.command("start"))
+async def start_handler(_: Client, message: Message) -> None:
+    if not is_authorized(message):
+        await message.reply_text("🚫 You are not allowed to run reports.")
+        return
+
+    state.set_waiting(message.from_user.id, True)
+    await message.reply_text(
+        "Send the @username or numeric ID of the target account to start reporting.\n"
+        "Sessions will be loaded from the sessions/ folder and run concurrently."
+    )
+
+
+@app.on_message(filters.text & filters.private)
+async def username_handler(_: Client, message: Message) -> None:
+    if not is_authorized(message) or not state.is_waiting(message.from_user.id):
+        return
+
+    username = message.text.strip()
+    session_files = scan_session_files()
+    if not session_files:
+        await message.reply_text("No .session files found in the sessions/ folder.")
+        state.set_waiting(message.from_user.id, False)
+        return
+
+    clients = build_clients(session_files)
+    await message.reply_text(
+        f"🚀 Starting reports for {username} using {len(clients)} sessions."
+    )
+
+    start_time = time.perf_counter()
+    stats = await report_user(username, clients, max_reports=MAX_REPORTS)
+    duration = time.perf_counter() - start_time
+
+    await message.reply_text(
+        "✅ Reporting complete\n"
+        f"Target: {username}\n"
+        f"Sessions used: {len(clients)}\n"
+        f"Attempts: {stats['attempts']} / {MAX_REPORTS}\n"
+        f"Success: {stats['success']} | Failed: {stats['failed']}\n"
+        f"Duration: {duration:.2f}s"
+    )
+    state.set_waiting(message.from_user.id, False)
+
+
+async def main() -> None:
+    await app.start()
+    logging.info("Bot started. Waiting for commands...")
+    await idle()
+    await app.stop()
+
+
+async def idle() -> None:
+    await asyncio.Event().wait()
 
 
 if __name__ == "__main__":
     try:
-        main()
+        asyncio.run(main())
     except KeyboardInterrupt:
         logging.info("Bot stopped by user.")

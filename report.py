@@ -1,9 +1,9 @@
-"""Reporting helpers built on top of pyrogram.Client.
-"""
-The module adds a small `send_report` helper to :class:`pyrogram.Client` so the
-bot can call the raw MTProto ``messages.Report`` RPC with clean ergonomics. The
-functions here keep networking concerns centralized: concurrency, retries, and
-basic resilience are handled by higher-level flows in ``main.py``.
+"""Reporting helpers built on top of :class:`pyrogram.Client`.
+
+The module adds a small `send_report` helper so the bot can call the raw
+MTProto ``messages.Report`` RPC with clean ergonomics. The functions here keep
+networking concerns centralized: concurrency, retries, and basic resilience are
+handled by higher-level flows in ``main.py``.
 """
 from __future__ import annotations
 

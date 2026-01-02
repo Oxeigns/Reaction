@@ -33,8 +33,11 @@ REASON_LABELS = {
     2: "Pornography",
     3: "Child abuse",
     4: "Copyright",
-    5: "Other",
-    6: "Illegal content",
+    5: "Geo irrelevant",
+    6: "Fake account",
+    7: "Illegal drugs",
+    8: "Personal details",
+    9: "Other",
 }
 
 __all__ = [

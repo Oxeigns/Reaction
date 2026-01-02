@@ -1,5 +1,5 @@
 """Reporting helpers built on top of pyrogram.Client.
-
+"""
 The module adds a small `send_report` helper to :class:`pyrogram.Client` so the
 bot can call the raw MTProto ``messages.Report`` RPC with clean ergonomics. The
 functions here keep networking concerns centralized: concurrency, retries, and
@@ -15,7 +15,11 @@ from pyrogram.errors import BadRequest, FloodWait, MessageIdInvalid, RPCError
 from pyrogram.raw.types import (
     InputReportReasonChildAbuse,
     InputReportReasonCopyright,
+    InputReportReasonFake,
+    InputReportReasonGeoIrrelevant,
+    InputReportReasonIllegalDrugs,
     InputReportReasonOther,
+    InputReportReasonPersonalDetails,
     InputReportReasonPornography,
     InputReportReasonSpam,
     InputReportReasonViolence,
@@ -31,8 +35,11 @@ def _build_reason(reason: int | object, message: str) -> object:
         2: InputReportReasonPornography,
         3: InputReportReasonChildAbuse,
         4: InputReportReasonCopyright,
-        5: InputReportReasonOther,
-        6: InputReportReasonOther,
+        5: InputReportReasonGeoIrrelevant,
+        6: InputReportReasonFake,
+        7: InputReportReasonIllegalDrugs,
+        8: InputReportReasonPersonalDetails,
+        9: InputReportReasonOther,
     }
 
     if hasattr(reason, "write"):
@@ -48,6 +55,49 @@ def _build_reason(reason: int | object, message: str) -> object:
         return reason_cls()
 
     return reason_cls()
+
+
+async def _resolve_peer_for_report(client: Client, chat_id):
+    """Resolve usernames or numeric ids into raw peers for reporting.
+
+    Pyrogram's async helper resolves numeric IDs easily but can return
+    ``UsernameInvalid`` for plain strings if they are not cached. To keep the
+    reporting surface robust we fall back to ``contacts.ResolveUsername`` and
+    build the appropriate ``InputPeer*`` instance manually.
+    """
+
+    from pyrogram.errors import UsernameInvalid
+    from pyrogram.raw.functions.contacts import ResolveUsername
+    from pyrogram.raw.types import InputPeerChannel, InputPeerChat, InputPeerUser
+
+    if hasattr(chat_id, "write"):
+        return chat_id
+
+    try:
+        peer = client.resolve_peer(chat_id) if hasattr(client, "resolve_peer") else chat_id
+        return await peer if asyncio.iscoroutine(peer) else peer
+    except UsernameInvalid:
+        pass
+    except Exception:
+        # Fallback to raw resolution only when the built-in resolver fails; the
+        # raw call can still raise and is handled by the caller.
+        pass
+
+    username = str(chat_id).lstrip("@")
+    try:
+        resolved = await client.invoke(ResolveUsername(username=username))
+        if resolved.users:
+            user = resolved.users[0]
+            return InputPeerUser(user_id=user.id, access_hash=user.access_hash)
+        if resolved.chats:
+            chat = resolved.chats[0]
+            if hasattr(chat, "access_hash"):
+                return InputPeerChannel(channel_id=chat.id, access_hash=chat.access_hash)
+            return InputPeerChat(chat_id=chat.id)
+    except Exception:
+        pass
+
+    raise BadRequest("Unable to resolve the target for reporting.")
 
 
 async def send_report(client: Client, chat_id, message_id: int, reason: int | object, reason_text: str) -> bool:
@@ -164,11 +214,7 @@ if not hasattr(Client, "send_report"):
         """High-level wrapper for the raw ``messages.Report`` call."""
 
         try:
-            if hasattr(chat_id, "write"):
-                peer = chat_id
-            else:
-                peer = self.resolve_peer(chat_id) if hasattr(self, "resolve_peer") else chat_id
-                peer = await peer if asyncio.iscoroutine(peer) else peer
+            peer = await _resolve_peer_for_report(self, chat_id)
 
             if not hasattr(peer, "write"):
                 raise BadRequest("Unable to resolve the target for reporting.")

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
 from copy import deepcopy
 from datetime import datetime, timezone
 from html import escape as html_escape
-from typing import TYPE_CHECKING, Iterable, Callable, Awaitable
+from typing import TYPE_CHECKING, Awaitable, Callable, Iterable
 
 import config
 from telegram.constants import ParseMode
@@ -47,6 +48,64 @@ def _session_label(session: str) -> str:
 StatusCallback = Callable[[dict], Awaitable[None]]
 
 
+class SessionPool:
+    """Manage Pyrogram client lifecycles with timeouts and bookkeeping."""
+
+    def __init__(self, api_id: int, api_hash: str, *, start_timeout: int = 25, stop_timeout: int = 10,
+                 start_concurrency: int = 10) -> None:
+        self.api_id = api_id
+        self.api_hash = api_hash
+        self.start_timeout = max(5, start_timeout)
+        self.stop_timeout = max(3, stop_timeout)
+        self.start_concurrency = max(1, start_concurrency)
+
+    async def start(self, sessions: list[str]) -> tuple[list["Client"], dict["Client", str], int, set[str]]:
+        from pyrogram.client import Client
+        from pyrogram.errors import UserDeactivated
+
+        semaphore = asyncio.Semaphore(self.start_concurrency)
+        clients: list[Client] = []
+        client_session_map: dict[Client, str] = {}
+        failed_sessions = 0
+        invalid_sessions: set[str] = set()
+
+        async def _start_single(idx: int, session: str) -> None:
+            nonlocal failed_sessions
+            client = Client(
+                name=f"reporter_{idx}",
+                api_id=self.api_id,
+                api_hash=self.api_hash,
+                session_string=session,
+                workdir=f"/tmp/report_session_{idx}",
+            )
+
+            async with semaphore:
+                try:
+                    await asyncio.wait_for(client.start(), timeout=self.start_timeout)
+                except UserDeactivated:
+                    failed_sessions += 1
+                    invalid_sessions.add(session)
+                    logging.warning("Session %s is deactivated; skipping and removing.", _session_label(session))
+                    return
+                except Exception:
+                    failed_sessions += 1
+                    logging.exception("Failed to start client %s during reporting", client.name)
+                    return
+
+            clients.append(client)
+            client_session_map[client] = session
+
+        await asyncio.gather(*[_start_single(idx, session) for idx, session in enumerate(sessions)])
+        return clients, client_session_map, failed_sessions, invalid_sessions
+
+    async def close(self, clients: Iterable["Client"]) -> None:
+        for client in clients:
+            try:
+                await asyncio.wait_for(client.stop(), timeout=self.stop_timeout)
+            except Exception:
+                logging.exception("Failed to stop client %s", getattr(client, "name", "unknown"))
+
+
 async def run_report_job(query, context: ContextTypes.DEFAULT_TYPE, job_data: dict) -> None:
     user = query.from_user
     chat_id = query.message.chat_id
@@ -57,7 +116,9 @@ async def run_report_job(query, context: ContextTypes.DEFAULT_TYPE, job_data: di
     sessions = job_data.get("sessions", [])
     api_id = job_data.get("api_id")
     api_hash = job_data.get("api_hash")
-    reason_code = job_data.get("reason_code", 5)
+    reason_code = job_data.get("reason_code", 9)
+    reason_cycle = job_data.get("reason_cycle", False)
+    request_timeout = int(job_data.get("request_timeout", 25))
 
     status_message = await context.bot.send_message(chat_id=chat_id, text="Preparing clients…")
 
@@ -157,6 +218,8 @@ async def run_report_job(query, context: ContextTypes.DEFAULT_TYPE, job_data: di
                     api_id=api_id,
                     api_hash=api_hash,
                     reason_code=reason_code,
+                    reason_cycle=reason_cycle,
+                    request_timeout=request_timeout,
                     invite_link=job_data.get("invite_link"),
                     status_callback=_update_status,
                 )
@@ -264,8 +327,10 @@ async def perform_reporting(
     *,
     api_id: int | None,
     api_hash: str | None,
-    reason_code: int = 5,
+    reason_code: int = 9,
+    reason_cycle: bool = False,
     max_concurrency: int = 25,
+    request_timeout: int = 25,
     invite_link: str | None = None,
     status_callback: StatusCallback | None = None,
 ) -> dict:
@@ -306,29 +371,9 @@ async def perform_reporting(
             removed,
         )
 
-    clients: list[Client] = []
-    client_session_map: dict[Client, str] = {}
-    failed_sessions = 0
-
-    for idx, session in enumerate(valid_sessions):
-        client = Client(
-            name=f"reporter_{idx}",
-            api_id=api_id,
-            api_hash=api_hash,
-            session_string=session,
-            workdir=f"/tmp/report_session_{idx}",
-        )
-        try:
-            await client.start()
-            clients.append(client)
-            client_session_map[client] = session
-        except UserDeactivated:
-            failed_sessions += 1
-            invalid_sessions.add(session)
-            logging.warning("Session %s is deactivated; skipping and removing.", _session_label(session))
-        except Exception:
-            failed_sessions += 1
-            logging.exception("Failed to start client %s during reporting", client.name)
+    pool = SessionPool(api_id, api_hash, start_timeout=request_timeout)
+    clients, client_session_map, failed_sessions, newly_invalid = await pool.start(valid_sessions)
+    invalid_sessions |= newly_invalid
 
     if invalid_sessions:
         await data_store.remove_sessions(invalid_sessions)
@@ -383,7 +428,9 @@ async def perform_reporting(
                 while attempts < max_join_attempts:
                     attempts += 1
                     try:
-                        join_result = await ensure_join_if_needed(client, target_spec)
+                        join_result = await asyncio.wait_for(
+                            ensure_join_if_needed(client, target_spec), timeout=request_timeout
+                        )
                         if join_result.ok:
                             joined += 1
                             joined_clients.append(client)
@@ -394,6 +441,11 @@ async def perform_reporting(
                         join_progress[client.name].update({"status": "FAILED", "reason": join_result.reason})
                         if attempts >= max_join_attempts:
                             break
+                    except asyncio.TimeoutError:
+                        join_progress[client.name].update(
+                            {"status": "TIMEOUT", "reason": "join_timeout", "retry_after": None}
+                        )
+                        break
                     except Exception as exc:  # noqa: BLE001
                         code, detail, wait_seconds = map_pyrogram_error(exc)
                         join_progress[client.name].update(
@@ -443,54 +495,72 @@ async def perform_reporting(
                 }
 
         resolved_chat_id: int | None = None
-
-        if target_spec.kind not in {"message", "internal_message"}:
-            return {"success": 0, "failed": 0, "halted": True, "error": "NOT_SUPPORTED: only message links"}
+        primary = clients[0]
 
         await _push_status(
             {"target": {"validated": False, "summary": "validating target"}, "report": {"clients": join_progress}}
         )
 
         try:
-            primary = clients[0]
-            if target_spec.kind == "message" and target_spec.username and target_spec.message_id:
-                chat_ref = target_spec.username
-                message_id = target_spec.message_id
-            elif target_spec.kind == "internal_message" and target_spec.internal_id and target_spec.message_id:
-                chat_ref = int(f"-100{target_spec.internal_id}")
-                message_id = target_spec.message_id
-            else:
-                return {"success": 0, "failed": 0, "halted": True, "error": "MESSAGE_ID_INVALID"}
+            resolved = await asyncio.wait_for(resolve_entity(primary, target_spec), timeout=request_timeout)
+        except asyncio.TimeoutError:
+            await _push_status(
+                {"target": {"validated": False, "summary": "target validation failed", "error": "timeout"}}
+            )
+            return {"success": 0, "failed": 0, "halted": True, "error": "TARGET_TIMEOUT"}
 
-            message = await primary.get_messages(chat_ref, message_id)
-            if message is None:
-                return {"success": 0, "failed": 0, "halted": True, "error": "MESSAGE_NOT_FOUND"}
-            chat_id_for_validation = getattr(message, "chat", None)
-            if chat_id_for_validation and hasattr(chat_id_for_validation, "id"):
-                resolved_chat_id = int(getattr(chat_id_for_validation, "id"))
-            elif hasattr(message, "chat_id"):
-                resolved_chat_id = int(getattr(message, "chat_id"))
-            else:
-                resolved_chat_id = int(chat_ref)
-            await _push_status(
-                {
-                    "target": {
-                        "validated": True,
-                        "summary": f"chat: {chat_ref}, msg_id: {message_id}",
-                    },
-                    "report": {"clients": join_progress},
-                }
-            )
-        except Exception as exc:  # noqa: BLE001
-            code, detail, _ = map_pyrogram_error(exc)
-            await _push_status(
-                {"target": {"validated": False, "summary": "target validation failed", "error": f"{code}: {detail}"}}
-            )
-            return {"success": 0, "failed": 0, "halted": True, "error": f"{code}: {detail}"}
+        if not resolved.ok or not resolved.chat_id:
+            return {
+                "success": 0,
+                "failed": 0,
+                "halted": True,
+                "error": resolved.error or "UNRESOLVED_TARGET",
+            }
+
+        resolved_chat_id = int(resolved.chat_id)
+
+        if target_spec.message_id:
+            try:
+                message = await asyncio.wait_for(
+                    primary.get_messages(resolved_chat_id, target_spec.message_id), timeout=request_timeout
+                )
+                if message is None:
+                    return {"success": 0, "failed": 0, "halted": True, "error": "MESSAGE_NOT_FOUND"}
+                resolved_chat_id = int(getattr(getattr(message, "chat", None), "id", resolved_chat_id))
+            except Exception as exc:  # noqa: BLE001
+                code, detail, _ = map_pyrogram_error(exc)
+                await _push_status(
+                    {
+                        "target": {
+                            "validated": False,
+                            "summary": "target validation failed",
+                            "error": f"{code}: {detail}",
+                        }
+                    }
+                )
+                return {"success": 0, "failed": 0, "halted": True, "error": f"{code}: {detail}"}
+
+        await _push_status(
+            {
+                "target": {
+                    "validated": True,
+                    "summary": f"chat: {resolved_chat_id}, msg_id: {target_spec.message_id or 'n/a'}",
+                },
+                "report": {"clients": join_progress},
+            }
+        )
 
         if target_spec.requires_join:
             for client in clients:
-                join_result = await ensure_join_if_needed(client, target_spec)
+                try:
+                    join_result = await asyncio.wait_for(
+                        ensure_join_if_needed(client, target_spec), timeout=request_timeout
+                    )
+                except asyncio.TimeoutError:
+                    logging.warning(
+                        "Join attempt timed out for %s via %s", target, client.name
+                    )
+                    continue
                 if not join_result.ok:
                     logging.warning(
                         "Join attempt failed for %s via %s: %s",
@@ -507,7 +577,7 @@ async def perform_reporting(
 
         client_progress = {client.name: {"success": 0, "status": "READY", "reason": None} for client in clients}
 
-        async def report_once(client: Client) -> bool:
+        async def report_once(client: Client, reason_choice: int | object) -> bool:
             nonlocal halted
             try:
                 chat, access_error = await resolve_chat_safe(
@@ -526,7 +596,7 @@ async def perform_reporting(
                     return False
 
                 result = await report_profile_photo(
-                    client, resolved_chat_id, reason=reason_code, reason_text=reason_text
+                    client, resolved_chat_id, reason=reason_choice, reason_text=reason_text
                 )
                 if result:
                     client_progress[client.name]["success"] += 1
@@ -538,7 +608,7 @@ async def perform_reporting(
                 await asyncio.sleep(wait_for)
                 try:
                     result = await report_profile_photo(
-                        client, resolved_chat_id, reason=reason_code, reason_text=reason_text
+                        client, resolved_chat_id, reason=reason_choice, reason_text=reason_text
                     )
                     if result:
                         client_progress[client.name]["success"] += 1
@@ -577,10 +647,15 @@ async def perform_reporting(
                 return False
 
         worker_count = max(1, min(max_concurrency, total, len(clients)))
-        queue: asyncio.Queue[Client] = asyncio.Queue()
+        queue: asyncio.Queue[tuple[Client, int | object]] = asyncio.Queue()
+
+        reason_sequence: list[int | object] = [reason_code]
+        if reason_cycle:
+            reason_sequence = list(range(0, 10))
+        reason_iter = itertools.cycle(reason_sequence)
 
         for _ in range(total):
-            queue.put_nowait(clients[_ % len(clients)])
+            queue.put_nowait((clients[_ % len(clients)], next(reason_iter)))
 
         async def worker() -> None:
             nonlocal success, failed, halted
@@ -595,17 +670,24 @@ async def perform_reporting(
                     break
 
                 try:
-                    client = queue.get_nowait()
+                    client, chosen_reason = queue.get_nowait()
                 except asyncio.QueueEmpty:
                     break
 
                 try:
-                    result = await report_once(client)
+                    result = await asyncio.wait_for(
+                        report_once(client, chosen_reason), timeout=request_timeout
+                    )
                     if result:
                         success += 1
                         client_progress[client.name]["reason"] = None
                     else:
                         failed += 1
+                except asyncio.TimeoutError:
+                    failed += 1
+                    client_progress[client.name].update(
+                        {"status": "TIMEOUT", "reason": "request_timeout", "retry_after": None}
+                    )
                 except Exception as exc:  # noqa: BLE001
                     failed += 1
                     code, detail, retry_after = map_pyrogram_error(exc)
@@ -618,7 +700,7 @@ async def perform_reporting(
                         {
                             "target": {
                                 "validated": True,
-                                "summary": f"chat: {resolved_chat_id}, msg_id: {target_spec.message_id}",
+                                "summary": f"chat: {resolved_chat_id}, msg_id: {target_spec.message_id or 'n/a'}",
                             },
                             "report": {
                                 "success": success,
@@ -647,11 +729,7 @@ async def perform_reporting(
     except ValueError as exc:
         return {"success": 0, "failed": 0, "halted": False, "error": str(exc)}
     finally:
-        for client in clients:
-            try:
-                await client.stop()
-            except Exception:
-                pass
+        await pool.close(clients)
 
 
 __all__ = ["run_report_job", "perform_reporting"]

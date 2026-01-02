@@ -138,8 +138,8 @@ def target_kind_keyboard() -> InlineKeyboardMarkup:
 
 def reason_keyboard() -> InlineKeyboardMarkup:
     """Buttons covering the available Pyrogram/Telegram report reasons."""
-    # Keep your original callback mapping/order (0,3,2,1,6,4,5)
-    order = [0, 3, 2, 1, 6, 4, 5]
+    # Keep your original callback mapping/order (0,3,2,1,6,4,5) and append new ones
+    order = [0, 3, 2, 1, 6, 4, 5, 7, 8, 9]
     reason_buttons = [
         InlineKeyboardButton(REASON_LABELS[i], callback_data=f"reason:{i}")
         for i in order

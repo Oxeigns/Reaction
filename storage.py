@@ -1,4 +1,4 @@
-"""Async storage helpers for session strings and report summaries."""
+"""Async storage helpers for sessions, configuration, and audit logs."""
 from __future__ import annotations
 
 import datetime as dt
@@ -8,7 +8,7 @@ from typing import Iterable
 
 
 class DataStore:
-    """Persist session strings and report audit records."""
+    """Persist session strings, chat configuration, and report audit records."""
 
     def __init__(
         self,
@@ -23,12 +23,15 @@ class DataStore:
         self.mongo_uri = mongo_uri or os.getenv(self.mongo_env_var, "")
         self._in_memory_sessions: set[str] = set()
         self._in_memory_reports: list[dict] = []
+        self._in_memory_config: dict[str, int | None] = {"session_group": None, "logs_group": None}
+        self._in_memory_chats: set[int] = set()
 
         self.client = client
         self.db = db or (self.client.get_default_database() if self.client else None)
         if not self.db and self.client:
             self.db = self.client[db_name]
 
+    # ------------------- Session storage -------------------
     async def add_sessions(self, sessions: Iterable[str], added_by: int | None = None) -> list[str]:
         """Add unique session strings and return the list that were newly stored."""
 
@@ -66,18 +69,6 @@ class DataStore:
 
         return list(self._in_memory_sessions)
 
-    async def record_report(self, payload: dict) -> None:
-        """Persist a report summary payload."""
-
-        payload = {
-            **payload,
-            "stored_at": dt.datetime.utcnow(),
-        }
-        if self.db:
-            await self.db.reports.insert_one(payload)
-        else:
-            self._in_memory_reports.append(payload)
-
     async def remove_sessions(self, sessions: Iterable[str]) -> int:
         """Remove sessions from persistence, returning the count removed."""
 
@@ -97,6 +88,58 @@ class DataStore:
 
         return removed
 
+    # ------------------- Report records -------------------
+    async def record_report(self, payload: dict) -> None:
+        """Persist a report summary payload."""
+
+        payload = {
+            **payload,
+            "stored_at": dt.datetime.utcnow(),
+        }
+        if self.db:
+            await self.db.reports.insert_one(payload)
+        else:
+            self._in_memory_reports.append(payload)
+
+    # ------------------- Config storage -------------------
+    async def set_session_group(self, chat_id: int) -> None:
+        await self._set_config_value("session_group", chat_id)
+
+    async def session_group(self) -> int | None:
+        return await self._get_config_value("session_group")
+
+    async def set_logs_group(self, chat_id: int) -> None:
+        await self._set_config_value("logs_group", chat_id)
+
+    async def logs_group(self) -> int | None:
+        return await self._get_config_value("logs_group")
+
+    async def _set_config_value(self, key: str, value: int | None) -> None:
+        if self.db:
+            await self.db.config.update_one({"_id": "config"}, {"$set": {key: value}}, upsert=True)
+        else:
+            self._in_memory_config[key] = value
+
+    async def _get_config_value(self, key: str) -> int | None:
+        if self.db:
+            doc = await self.db.config.find_one({"_id": "config"}, {"_id": False, key: True})
+            return doc.get(key) if doc else None
+        return self._in_memory_config.get(key)
+
+    # ------------------- Known chats -------------------
+    async def add_known_chat(self, chat_id: int) -> None:
+        if self.db:
+            await self.db.chats.update_one({"chat_id": chat_id}, {"$set": {"chat_id": chat_id}}, upsert=True)
+        else:
+            self._in_memory_chats.add(chat_id)
+
+    async def known_chats(self) -> list[int]:
+        if self.db:
+            cursor = self.db.chats.find({}, {"_id": False, "chat_id": True})
+            return [doc["chat_id"] async for doc in cursor]
+        return list(self._in_memory_chats)
+
+    # ------------------- Lifecycle -------------------
     async def close(self) -> None:
         if self.client:
             self.client.close()
@@ -108,48 +151,17 @@ class DataStore:
         return bool(self.db)
 
 
-class FallbackDataStore:
+class FallbackDataStore(DataStore):
     """In-memory persistence used when MongoDB is unavailable."""
 
     def __init__(self) -> None:
-        self._in_memory_sessions: set[str] = set()
-        self._in_memory_reports: list[dict] = []
-        self.client = None
-        self.db = None
+        super().__init__(client=None, db=None)
 
-    async def add_sessions(self, sessions: Iterable[str], added_by: int | None = None) -> list[str]:
-        added: list[str] = []
-        normalized = [s.strip() for s in sessions if s and s.strip()]
-        for session in normalized:
-            if session not in self._in_memory_sessions:
-                self._in_memory_sessions.add(session)
-                added.append(session)
-        return added
-
-    async def get_sessions(self) -> list[str]:
-        return list(self._in_memory_sessions)
-
-    async def record_report(self, payload: dict) -> None:
-        payload = {
-            **payload,
-            "stored_at": dt.datetime.utcnow(),
-        }
-        self._in_memory_reports.append(payload)
-
-    async def remove_sessions(self, sessions: Iterable[str]) -> int:
-        targets = {s for s in sessions if s}
-        removed = 0
-        for session in list(targets):
-            if session in self._in_memory_sessions:
-                self._in_memory_sessions.discard(session)
-                removed += 1
-        return removed
-
-    async def close(self) -> None:  # pragma: no cover - symmetry with DataStore
+    async def close(self) -> None:
         return None
 
     @property
-    def is_persistent(self) -> bool:
+    def is_persistent(self) -> bool:  # pragma: no cover - small override
         return False
 
 
@@ -158,7 +170,7 @@ def build_datastore(
     *,
     db_name: str = "reporter",
     mongo_env_var: str = "MONGO_URI",
-) -> DataStore | FallbackDataStore:
+) -> DataStore:
     """Build a datastore safely, falling back when MongoDB is unavailable."""
 
     resolved_uri = mongo_uri or os.getenv(mongo_env_var, "")
@@ -190,3 +202,4 @@ def build_datastore(
             exc,
         )
         return FallbackDataStore()
+

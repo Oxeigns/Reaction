@@ -82,6 +82,45 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
         sessions = await prune_sessions(persistence, announce=True)
         return sessions
 
+    async def _prompt_report_count(message: Message) -> None:
+        await message.reply_text(
+            (
+                "How many reports do you want to send? "
+                f"Choose between {config.MIN_REPORTS} and {config.MAX_REPORTS}."
+            ),
+            reply_markup=report_count_keyboard(),
+        )
+
+    async def _apply_report_count(message: Message, state, count: int) -> None:
+        if count < config.MIN_REPORTS or count > config.MAX_REPORTS:
+            await message.reply_text(
+                f"Please choose a value between {config.MIN_REPORTS} and {config.MAX_REPORTS}."
+            )
+            return
+
+        state.report_count = count
+        await message.reply_text(f"✅ Will send {count} reports.")
+
+        next_stage = state.next_stage_after_count or "awaiting_link"
+        state.next_stage_after_count = None
+        if next_stage == "awaiting_private_join":
+            state.stage = "awaiting_private_join"
+            await message.reply_text(
+                "Send the private group/channel invite link or username so I can join with all sessions."
+            )
+            return
+        if next_stage == "awaiting_link":
+            state.stage = "awaiting_link"
+            await message.reply_text(
+                "Send the target message link (https://t.me/...) to report."
+            )
+            return
+        if next_stage == "begin_report":
+            await _begin_report(message, state)
+            return
+
+        state.stage = next_stage
+
     async def _is_sudo_user(user_id: int | None) -> bool:
         if user_id is None:
             return False
@@ -404,16 +443,11 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
             await query.answer()
             return
         state.report_type = query.data.split(":")[-1]
-        if state.report_type == "private":
-            state.stage = "awaiting_private_join"
-            await query.message.reply_text(
-                "Send the private group/channel invite link or username so I can join with all sessions."
-            )
-        else:
-            state.stage = "awaiting_link"
-            await query.message.reply_text(
-                "Send the target message link (https://t.me/...) to report."
-            )
+        state.next_stage_after_count = (
+            "awaiting_private_join" if state.report_type == "private" else "awaiting_link"
+        )
+        state.stage = "awaiting_count"
+        await _prompt_report_count(query.message)
         await _log_stage("Report Type", f"User {query.from_user.id} chose {state.report_type}")
         await query.answer()
 
@@ -438,19 +472,21 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
             state.stage = "awaiting_reason_text"
             state.reason_code = 9
             state.reason_text = None
+            state.next_stage_after_count = "begin_report"
             await query.message.reply_text("Please type the custom reason to submit with your report.")
             await query.answer()
             return
 
         state.reason_code = code
         state.reason_text = label
+        state.next_stage_after_count = "begin_report"
         await query.answer(f"Reason set to {label}")
         await _log_stage("Report Reason", f"User {query.from_user.id} selected {label}")
-        state.stage = "awaiting_count"
-        await query.message.reply_text(
-            "How many reports do you want to send?",
-            reply_markup=report_count_keyboard(),
-        )
+        if state.report_count is None:
+            state.stage = "awaiting_count"
+            await _prompt_report_count(query.message)
+        else:
+            await _begin_report(query.message, state)
 
     async def _handle_count(query: CallbackQuery) -> None:
         if not query.from_user or not await _is_sudo_user(query.from_user.id):
@@ -466,9 +502,7 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
             await query.answer("Invalid selection", show_alert=True)
             return
 
-        state.report_count = count
-        await query.message.reply_text(f"✅ Will send {count} reports.")
-        await _begin_report(query.message, state)
+        await _apply_report_count(query.message, state, count)
         await query.answer()
 
     @app.on_message(
@@ -523,13 +557,14 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
         if state.stage == "awaiting_count":
             try:
                 count = int(message.text.strip())
-                if count <= 0:
-                    raise ValueError()
-                state.report_count = count
-                await message.reply_text(f"✅ Will send {count} reports.")
-                await _begin_report(message, state)
+                await _apply_report_count(message, state, count)
             except ValueError:
-                await message.reply_text("Please enter a valid number of reports (e.g., 10).")
+                await message.reply_text(
+                    (
+                        "Please enter a valid number of reports "
+                        f"between {config.MIN_REPORTS} and {config.MAX_REPORTS}."
+                    )
+                )
             return
 
         if state.stage == "awaiting_reason_text":
@@ -537,12 +572,13 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
             if not state.reason_text:
                 await message.reply_text("Please type a custom reason.")
                 return
-            state.stage = "awaiting_count"
+            state.next_stage_after_count = "begin_report"
             await _log_stage("Custom Reason", f"User {message.from_user.id} provided custom reason")
-            await message.reply_text(
-                "How many reports do you want to send?",
-                reply_markup=report_count_keyboard(),
-            )
+            if state.report_count is None:
+                state.stage = "awaiting_count"
+                await _prompt_report_count(message)
+            else:
+                await _begin_report(message, state)
             return
 
         await message.reply_text("Use Start Report to begin a new report.")
@@ -599,12 +635,14 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
             status = "Success" if success else "❌ Failed"
             summary_lines = [
                 "📊 Report attempt summary:",
-                f"- Target: {state.target_link}",
-                f"- Type: {'Private' if state.report_type == 'private' else 'Public'}",
-                f"- Sessions requested: {result['requested']}",
-                f"- Sessions attempted: {result['attempted']} / {result['total_sessions']} available",
-                f"- Successful reports: {result['success_count']}",
-                f"- Failed reports: {result['failure_count']}",
+                f"- Report type: {'Private' if state.report_type == 'private' else 'Public'}",
+                f"- Target link: {state.target_link}",
+                f"- Requested attempts: {result['requested']}",
+                f"- Total attempts: {result['attempted']}",
+                f"- Successful attempts: {result['success_count']}",
+                f"- Failed attempts: {result['failure_count']}",
+                f"- Sessions available: {result['total_sessions']}",
+                f"- Time taken: {elapsed:.1f}s",
             ]
             await message.reply_text("\n".join([f"Report completed. Status: {status}"] + summary_lines))
             await persistence.record_report(
@@ -638,7 +676,9 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
     async def _execute_report(message: Message, state) -> dict:
         sessions = await prune_sessions(persistence)
         total_sessions = len(sessions)
-        requested_count = state.report_count or total_sessions
+        requested_count = max(
+            config.MIN_REPORTS, min(state.report_count or config.MIN_REPORTS, config.MAX_REPORTS)
+        )
         if not sessions:
             await message.reply_text("No valid sessions available.")
             return {
@@ -672,16 +712,15 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
         success_any = False
         success_count = 0
         failure_count = 0
-
-        attempt_limit = min(requested_count, total_sessions)
-
-        for idx, session in enumerate(sessions[:attempt_limit]):
+        attempted = 0
+        while attempted < requested_count and total_sessions:
+            session = sessions[attempted % total_sessions]
             client = Client(
-                name=f"report_{idx}",
+                name=f"report_{attempted}",
                 api_id=config.API_ID,
                 api_hash=config.API_HASH,
                 session_string=session,
-                workdir=f"/tmp/report_{idx}",
+                workdir=f"/tmp/report_{attempted}",
             )
             try:
                 await client.start()
@@ -691,18 +730,17 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
                 await asyncio.sleep(1.5)
             except RPCError:
                 failure_count += 1
-                continue
             except Exception:
                 failure_count += 1
-                continue
             finally:
+                attempted += 1
                 with contextlib.suppress(Exception):
                     await client.stop()
         return {
             "any_success": success_any,
             "success_count": success_count,
             "failure_count": failure_count,
-            "attempted": attempt_limit,
+            "attempted": attempted,
             "total_sessions": total_sessions,
             "requested": requested_count,
         }

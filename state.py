@@ -19,6 +19,7 @@ class UserState:
     reason_code: Optional[int] = None
     reason_text: Optional[str] = None
     report_count: Optional[int] = None  # ✅ NEW: Number of reports user wants
+    next_stage_after_count: Optional[str] = None
     started_at: float = field(default_factory=monotonic)
 
     def reset(self) -> None:
@@ -28,6 +29,7 @@ class UserState:
         self.reason_code = None
         self.reason_text = None
         self.report_count = None  # ✅ Reset on new session
+        self.next_stage_after_count = None
         self.started_at = monotonic()
 
 

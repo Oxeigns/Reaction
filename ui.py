@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
+import config
+
 REPORT_REASONS = {
     "spam": ("Spam", 0),
     "violence": ("Violence", 1),
@@ -49,18 +51,11 @@ def reason_keyboard() -> InlineKeyboardMarkup:
 
 
 def report_count_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("1000 Reports", callback_data="report:count:1000"),
-                InlineKeyboardButton("2500 Reports", callback_data="report:count:2500"),
-            ],
-            [
-                InlineKeyboardButton("4000 Reports", callback_data="report:count:4000"),
-                InlineKeyboardButton("7000 Reports", callback_data="report:count:7000"),
-            ],
-        ]
-    )
+    buttons = []
+    # Offer a small range of options within the configured bounds.
+    for value in (config.MIN_REPORTS, (config.MIN_REPORTS + config.MAX_REPORTS) // 2, config.MAX_REPORTS):
+        buttons.append([InlineKeyboardButton(f"{value} Reports", callback_data=f"report:count:{value}")])
+    return InlineKeyboardMarkup(buttons)
 
 
 def queued_message(position: int) -> str:

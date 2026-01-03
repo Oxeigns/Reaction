@@ -44,15 +44,16 @@ async def log_report_summary(
 ) -> None:
     """Send a summary entry after a report completes."""
 
-    status_label = "Success" if success else "Failed"
-    status_prefix = "✅" if success else "❌"
-    mention = getattr(user, "first_name", None) or "User"
+    username = getattr(user, "username", None)
+    user_label = f"@{username}" if username else getattr(user, "first_name", None) or "User"
     duration = round(elapsed, 2)
+    status_label = "Success" if success else "Fail"
+    status_prefix = "✅" if success else "❌"
     text = (
-        "📄 Report Summary\n"
-        f"👤 {mention}\n"
+        "✅ Report Completed\n"
+        f"👤 User: {user_label} ({getattr(user, 'id', 'n/a')})\n"
         f"🔗 Target: {target}\n"
-        f"⏱ Duration: {duration}s\n"
+        f"⏱ Time taken: {duration}s\n"
         f"{status_prefix} Status: {status_label}"
     )
     await send_log(client, logs_group, text, parse_mode="markdown")

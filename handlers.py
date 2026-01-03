@@ -17,7 +17,7 @@ from logging_utils import log_error, log_report_summary, log_user_start, send_lo
 from report import send_report
 from session_bot import extract_sessions_from_text, prune_sessions, validate_session_string
 from state import QueueEntry, ReportQueue, StateManager
-from sudo import is_owner, is_sudo
+from sudo import is_owner
 from ui import REPORT_REASONS, owner_panel, queued_message, reason_keyboard, report_type_keyboard, sudo_panel
 
 
@@ -50,6 +50,22 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
 
     queue.set_error_handler(_queue_error)
 
+    async def _log_stage(stage: str, detail: str) -> None:
+        await send_log(
+            app,
+            await persistence.get_logs_group_id(),
+            f"🛰 {stage}\n{detail}",
+        )
+
+    async def _is_sudo_user(user_id: int | None) -> bool:
+        if user_id is None:
+            return False
+        if is_owner(user_id):
+            return True
+        sudo_users = await persistence.get_sudo_users()
+        allowed = sudo_users or set(config.SUDO_USERS)
+        return user_id in allowed
+
     async def _owner_guard(message: Message) -> bool:
         if not message.from_user or not is_owner(message.from_user.id):
             await message.reply_text("Only the owner can manage sudo users.")
@@ -68,33 +84,30 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
         await persistence.add_known_chat(message.chat.id)
         await log_user_start(app, await persistence.get_logs_group_id(), message)
 
-        if not is_sudo(user_id):
-            await message.reply_text("🚫 You are not authorized to use this bot.")
+        if not await _is_sudo_user(user_id):
+            await message.reply_text("You are not authorized to use this bot.")
+            await _log_stage("Unauthorized", f"User {user_id} attempted /start")
             return
 
         live_sessions = await prune_sessions(persistence)
 
-        if is_owner(user_id):
-            if not live_sessions:
-                await message.reply_text(
-                    "No sessions found. Please contact the bot owner.",
-                )
-                return
+        if not live_sessions:
+            await message.reply_text("No sessions found. Contact owner")
+            await _log_stage("Start", f"User {user_id} saw empty session list")
+            return
 
+        if is_owner(user_id):
             await message.reply_text(
                 f"Live sessions: {len(live_sessions)}",
                 reply_markup=owner_panel(len(live_sessions)),
             )
+            await _log_stage("Owner Start", f"Owner opened panel with {len(live_sessions)} sessions")
         else:
-            if not live_sessions:
-                await message.reply_text(
-                    "No sessions found. Please contact the bot owner.",
-                )
-                return
             await message.reply_text(
                 f"Live sessions: {len(live_sessions)}",
                 reply_markup=sudo_panel(len(live_sessions)),
             )
+            await _log_stage("Sudo Start", f"Sudo {user_id} ready to report with {len(live_sessions)} sessions")
 
     @app.on_message(filters.command("addsudo"))
     async def add_sudo(_: Client, message: Message) -> None:
@@ -113,13 +126,15 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
         if is_owner(user_id):
             await message.reply_text("Owner already has access.")
             return
-        if user_id in config.SUDO_USERS:
+        sudo_users = await persistence.get_sudo_users()
+        if user_id in sudo_users:
             await message.reply_text("User is already a sudo user.")
             return
 
-        config.SUDO_USERS.add(user_id)
+        await persistence.add_sudo_user(user_id)
         label = parts[2] if len(parts) > 2 else str(user_id)
         await message.reply_text(f"Added {label} ({user_id}) to sudo users.")
+        await _log_stage("Sudo Added", f"Owner added {user_id}")
 
     @app.on_message(filters.command("rmsudo"))
     async def remove_sudo(_: Client, message: Message) -> None:
@@ -135,12 +150,14 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
             return
 
         user_id = int(parts[1])
-        if user_id not in config.SUDO_USERS:
+        sudo_users = await persistence.get_sudo_users()
+        if user_id not in sudo_users:
             await message.reply_text("User is not in the sudo list.")
             return
 
-        config.SUDO_USERS.discard(user_id)
+        await persistence.remove_sudo_user(user_id)
         await message.reply_text(f"Removed {user_id} from sudo users.")
+        await _log_stage("Sudo Removed", f"Owner removed {user_id}")
 
     @app.on_message(filters.command("sudolist"))
     async def sudo_list(_: Client, message: Message) -> None:
@@ -150,7 +167,7 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
         if not await _owner_guard(message):
             return
 
-        sudo_users = sorted(config.SUDO_USERS)
+        sudo_users = sorted(await persistence.get_sudo_users())
         if not sudo_users:
             await message.reply_text("No sudo users configured.")
             return
@@ -166,7 +183,7 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
     async def _handle_start_report(query: CallbackQuery) -> None:
         if not query.message or not query.from_user:
             return
-        if not is_sudo(query.from_user.id):
+        if not await _is_sudo_user(query.from_user.id):
             await query.answer("Unauthorized", show_alert=True)
             return
 
@@ -176,11 +193,15 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
             await checking.edit_text("No sessions found. Please contact the bot owner.")
             return
 
+        await _log_stage("Start Report", f"User {query.from_user.id} checking in with {len(live_sessions)} sessions")
+
         if queue.is_busy() and queue.active_user != query.from_user.id:
             position = queue.expected_position(query.from_user.id)
             notice = queued_message(position)
             if notice:
                 await query.message.reply_text(notice)
+
+        await _log_stage("Report Queue", f"User {query.from_user.id} position set")
 
         state = states.get(query.from_user.id)
         state.reset()
@@ -196,7 +217,7 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
     async def _handle_type(query: CallbackQuery) -> None:
         if not query.from_user:
             return
-        if not is_sudo(query.from_user.id):
+        if not await _is_sudo_user(query.from_user.id):
             await query.answer("Unauthorized", show_alert=True)
             return
         state = states.get(query.from_user.id)
@@ -206,6 +227,7 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
         state.report_type = query.data.split(":")[-1]
         state.stage = "awaiting_link"
         await query.message.reply_text("Send the target message link (https://t.me/...) to report.")
+        await _log_stage("Report Type", f"User {query.from_user.id} chose {state.report_type}")
         await query.answer()
 
     @app.on_callback_query(filters.regex(r"^report:reason:[a-z_]+$"))
@@ -215,7 +237,7 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
     async def _handle_reason(query: CallbackQuery) -> None:
         if not query.from_user:
             return
-        if not is_sudo(query.from_user.id):
+        if not await _is_sudo_user(query.from_user.id):
             await query.answer("Unauthorized", show_alert=True)
             return
         key = query.data.split(":")[-1]
@@ -224,6 +246,7 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
         state.reason_code = code
         state.reason_text = label
         await query.answer(f"Reason set to {label}")
+        await _log_stage("Report Reason", f"User {query.from_user.id} selected {label}")
         await _begin_report(query.message, state)
 
     @app.on_message(filters.text & ~filters.command(["start", "broadcast", "set_session", "set_log"]))
@@ -231,7 +254,11 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
         await _wrap_errors(_handle_text, message)
 
     async def _handle_text(message: Message) -> None:
-        if not message.from_user or not is_sudo(message.from_user.id):
+        if not message.from_user:
+            return
+        if not await _is_sudo_user(message.from_user.id):
+            await message.reply_text("You are not authorized to use this bot.")
+            await _log_stage("Unauthorized", f"User {message.from_user.id} attempted text routing")
             return
         state = states.get(message.from_user.id)
         if state.stage == "awaiting_link":
@@ -241,10 +268,12 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
             state.target_link = message.text.strip()
             state.stage = "awaiting_reason"
             await message.reply_text("Choose a report reason", reply_markup=reason_keyboard())
+            await _log_stage("Target Link", f"User {message.from_user.id} provided link {state.target_link}")
             return
         if state.stage == "awaiting_reason":
             state.reason_text = message.text.strip()
             state.reason_code = 9
+            await _log_stage("Custom Reason", f"User {message.from_user.id} provided custom reason")
             await _begin_report(message, state)
             return
         await message.reply_text("Use Start Report to begin a new report.")
@@ -266,12 +295,14 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
             notice = queued_message(queue.expected_position(message.from_user.id))
             if notice:
                 await message.reply_text(notice)
+                await _log_stage("Queue Notice", f"User {message.from_user.id} queued")
 
         async def notify_position(position: int) -> None:
             if position > 1:
                 notice = queued_message(position)
                 if notice:
                     await message.reply_text(notice)
+                    await _log_stage("Queue Update", f"User {message.from_user.id} moved to {position}")
 
         entry = QueueEntry(
             message.from_user.id,
@@ -279,6 +310,7 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
             notify_position=notify_position,
         )
         await queue.enqueue(entry)
+        await _log_stage("Report Enqueued", f"User {message.from_user.id} job queued")
 
     async def _run_report_job(message: Message, state) -> None:
         try:
@@ -303,6 +335,10 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
                 elapsed=elapsed,
                 success=success,
             )
+            await _log_stage(
+                "Report Completed",
+                f"User {message.from_user.id} -> {state.target_link} ({'success' if success else 'fail'})",
+            )
         except Exception as exc:  # noqa: BLE001
             logging.exception("Report failed")
             await message.reply_text("Report failed due to an unexpected error.")
@@ -315,6 +351,8 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
         if not sessions:
             await message.reply_text("No valid sessions available.")
             return False
+
+        await _log_stage("Report Started", f"User {message.from_user.id} executing with {len(sessions)} sessions")
 
         try:
             chat_ref, msg_id = _parse_link(state.target_link, state.report_type == "private")
@@ -361,6 +399,7 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
         await persistence.save_session_group_id(message.chat.id)
         await persistence.add_known_chat(message.chat.id)
         await message.reply_text("✅ Session manager group set successfully.")
+        await _log_stage("Session Group Set", f"Session group updated to {message.chat.id}")
 
     @app.on_message(filters.command("set_log") & filters.group)
     async def set_log(_: Client, message: Message) -> None:
@@ -376,6 +415,7 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
         await persistence.save_logs_group_id(message.chat.id)
         await persistence.add_known_chat(message.chat.id)
         await message.reply_text("✅ Logs group set successfully.")
+        await _log_stage("Logs Group Set", f"Logs group updated to {message.chat.id}")
 
     @app.on_message(filters.command("broadcast"))
     async def broadcast(_: Client, message: Message) -> None:
@@ -420,18 +460,19 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
 
     async def _handle_session_ingestion(message: Message) -> None:
         session_group = await persistence.get_session_group_id()
-        print(f"🔍 [DEBUG] session_group={session_group}, chat.id={message.chat.id}")
         if message.chat.id != session_group:
             return
         if not message.from_user or not is_owner(message.from_user.id):
             return
 
         await message.reply_text("📥 Bot received your message.")
+        await _log_stage("Session Intake", f"Message captured in session group {message.chat.id}")
 
         text_content = message.text or message.caption or ""
         sessions = extract_sessions_from_text(text_content)
         if not sessions:
             await message.reply_text("❌ Invalid session string.")
+            await _log_stage("Session Intake", "No valid sessions found in message")
             return
 
         valid_count, invalid_count = 0, 0
@@ -446,8 +487,10 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
         if valid_count:
             total = len(await persistence.get_sessions())
             await message.reply_text(f"✅ Session saved.\n📦 Total valid sessions: {total}")
+            await _log_stage("Session Stored", f"{valid_count} new sessions saved; total {total}")
         if invalid_count:
             await message.reply_text("❌ Some session(s) were invalid.")
+            await _log_stage("Session Reject", f"{invalid_count} invalid sessions rejected")
 
     @app.on_callback_query(filters.regex(r"^owner:(manage|set_session_group|set_logs_group)$"))
     async def owner_actions(_: Client, query: CallbackQuery) -> None:

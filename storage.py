@@ -33,6 +33,7 @@ class DataStore:
         }
         self._in_memory_config: dict[str, int | None] = dict(self._config_defaults)
         self._in_memory_chats: set[int] = set()
+        self._sudo_users: set[int] = set(config.SUDO_USERS)
         self._snapshot_path: Path | None = None
 
         self.client = client
@@ -49,6 +50,7 @@ class DataStore:
         self._in_memory_reports = payload.get("reports", [])
         self._in_memory_config.update(payload.get("config", {}))
         self._in_memory_chats = set(payload.get("chats", []))
+        self._sudo_users = set(payload.get("sudo", [])) or set(config.SUDO_USERS)
 
     # ------------------- Session storage -------------------
     async def add_sessions(self, sessions: Iterable[str], added_by: int | None = None) -> list[str]:
@@ -199,6 +201,28 @@ class DataStore:
 
         self._persist_snapshot()
 
+    # ------------------- Sudo users -------------------
+    async def add_sudo_user(self, user_id: int) -> None:
+        self._sudo_users.add(user_id)
+        config.SUDO_USERS.add(user_id)
+        if self.db:
+            await self.db.sudo.update_one({"_id": user_id}, {"$set": {}}, upsert=True)
+        self._persist_snapshot()
+
+    async def remove_sudo_user(self, user_id: int) -> None:
+        self._sudo_users.discard(user_id)
+        config.SUDO_USERS.discard(user_id)
+        if self.db:
+            await self.db.sudo.delete_one({"_id": user_id})
+        self._persist_snapshot()
+
+    async def get_sudo_users(self) -> set[int]:
+        if self.db:
+            users = await self.db.sudo.find().to_list(length=None)
+            if users:
+                return set(u.get("_id") for u in users if "_id" in u)
+        return set(self._sudo_users)
+
     async def known_chats(self) -> list[int]:
         if self.db:
             cursor = self.db.chats.find({}, {"_id": False, "chat_id": True})
@@ -251,6 +275,7 @@ class FallbackDataStore(DataStore):
             "reports": self._in_memory_reports,
             "config": self._in_memory_config,
             "chats": list(self._in_memory_chats),
+            "sudo": list(self._sudo_users),
         }
         try:
             self._snapshot_path.write_text(json.dumps(payload, default=str))

@@ -31,8 +31,10 @@ class ReportTargetSpec:
 _TRIM_CHARS = ",.;)]}>'\\\""
 _SUCCESS_TTL = timedelta(minutes=10)
 _FAILURE_TTL = timedelta(minutes=5)
+_JOIN_SUCCESS_TTL = timedelta(minutes=5)
 _CACHE: dict[str, tuple[dict[str, Any], datetime]] = {}
 _FAILURE_CACHE: dict[str, tuple[dict[str, Any], datetime]] = {}
+_JOIN_CACHE: dict[tuple[str, str], datetime] = {}
 
 
 def _clean_target(raw: str) -> str:
@@ -168,6 +170,10 @@ def _purge_cache() -> None:
         for key in expired:
             store.pop(key, None)
 
+    expired_joins = [key for key, exp in _JOIN_CACHE.items() if exp <= now]
+    for key in expired_joins:
+        _JOIN_CACHE.pop(key, None)
+
 
 def _get_cached(normalized: str) -> dict[str, Any] | None:
     _purge_cache()
@@ -193,6 +199,115 @@ def _cache_result(normalized: str, result: dict[str, Any], *, failure: bool = Fa
 
 async def _sleep_for_flood(wait_seconds: int) -> None:
     await asyncio.sleep(min(wait_seconds, 60))
+
+
+async def _attempt_join(
+    client: Any,
+    spec: ReportTargetSpec,
+    *,
+    invite_link: str | None,
+    username: str | None,
+    allow_join: bool,
+) -> dict[str, Any]:
+    from pyrogram.errors import (  # type: ignore
+        FloodWait,
+        RPCError,
+        UserAlreadyParticipant,
+    )
+
+    session_name = getattr(client, "name", "client")
+    cache_key = (session_name, spec.cache_key())
+    now = datetime.now(timezone.utc)
+    cached = _JOIN_CACHE.get(cache_key)
+    if cached and cached > now:
+        return {"ok": True, "joined": False, "status": "cached", "session": session_name}
+
+    if not allow_join or not (invite_link or username):
+        return {"ok": False, "joined": False, "status": "join_not_possible", "session": session_name}
+
+    join_target = invite_link or username
+    attempts = 0
+
+    async def _join_once() -> dict[str, Any]:
+        try:
+            if invite_link:
+                invite_result = await join_by_invite(client, invite_link)
+                if not invite_result.get("ok"):
+                    wait_seconds = invite_result.get("wait_seconds") or 0
+                    if invite_result.get("status") == "VALID_BUT_RATE_LIMITED" and wait_seconds:
+                        await _sleep_for_flood(wait_seconds)
+                        return {
+                            "ok": False,
+                            "joined": False,
+                            "status": "flood_wait",
+                            "session": session_name,
+                            "error": "FloodWait",
+                            "wait_seconds": wait_seconds,
+                        }
+                    return {
+                        "ok": False,
+                        "joined": False,
+                        "status": invite_result.get("status", "join_failed"),
+                        "session": session_name,
+                        "error": invite_result.get("detail"),
+                    }
+                method = "invite"
+            else:
+                await client.join_chat(username)
+                method = "username"
+            _JOIN_CACHE[cache_key] = datetime.now(timezone.utc) + _JOIN_SUCCESS_TTL
+            logging.info(
+                "ReportTargetResolver: joined chat",
+                extra={"session_name": session_name, "method": method, "join_target": join_target},
+            )
+            return {"ok": True, "joined": True, "status": method, "session": session_name}
+        except UserAlreadyParticipant:
+            _JOIN_CACHE[cache_key] = datetime.now(timezone.utc) + _JOIN_SUCCESS_TTL
+            logging.info(
+                "ReportTargetResolver: already participant",
+                extra={"session_name": session_name, "join_target": join_target},
+            )
+            return {"ok": True, "joined": False, "status": "already", "session": session_name}
+        except FloodWait as fw:
+            wait_seconds = int(getattr(fw, "value", 0) or 0)
+            await _sleep_for_flood(wait_seconds or 1)
+            return {
+                "ok": False,
+                "joined": False,
+                "status": "flood_wait",
+                "session": session_name,
+                "error": fw.__class__.__name__,
+                "wait_seconds": wait_seconds or None,
+            }
+        except RPCError as exc:
+            logging.warning(
+                "ReportTargetResolver: join rpc error",
+                extra={"session_name": session_name, "error": exc.__class__.__name__},
+            )
+            return {
+                "ok": False,
+                "joined": False,
+                "status": "join_failed",
+                "session": session_name,
+                "error": exc.__class__.__name__,
+            }
+        except Exception as exc:  # noqa: BLE001
+            logging.exception("ReportTargetResolver: unexpected join failure")
+            return {
+                "ok": False,
+                "joined": False,
+                "status": "join_failed",
+                "session": session_name,
+                "error": exc.__class__.__name__,
+            }
+
+    while attempts < 2:
+        attempts += 1
+        result = await _join_once()
+        if result["ok"] or result.get("status") != "flood_wait":
+            return result
+
+    return {"ok": False, "joined": False, "status": "join_exhausted", "session": session_name}
 
 
 async def _try_get_chat(client: Any, spec: ReportTargetSpec) -> tuple[bool, Any | None, str | None]:
@@ -432,29 +547,13 @@ async def resolve_report_target(
         _cache_result(spec.cache_key(), result, failure=True)
         return result
 
-    fallback_result: dict[str, Any] | None = None
-    last_result: dict[str, Any] | None = None
-    for client in clients:
-        result = await _resolve_with_client(client, spec, allow_join=allow_join)
-        if result["ok"]:
-            if result["chat_id"] is None:
-                continue
-            _cache_result(spec.cache_key(), result)
-            return result
-        if result.get("note") == "try_next_client":
-            last_result = result
-            continue
-        if result.get("error") == "FloodWait":
-            await _sleep_for_flood(1)
-            last_result = result
-            continue
-        if fallback_result is None:
-            fallback_result = result
-        last_result = result
+    invite_link = spec.invite_link or (spec.invite_hash and f"https://t.me/+{spec.invite_hash}")
+    target_username = spec.username
+    join_required = spec.kind in {"internal_message", "invite"}
+    join_possible = bool(invite_link or target_username)
 
-    result = fallback_result or last_result
-    if result is None:
-        result = {
+    if join_required and not join_possible:
+        return {
             "ok": False,
             "kind": spec.kind,
             "normalized": spec.normalized,
@@ -462,9 +561,93 @@ async def resolve_report_target(
             "message_ids": spec.message_ids,
             "resolved_by": None,
             "did_join": False,
-            "note": "all_clients_failed",
-            "error": "unresolved",
+            "note": "internal_without_invite",
+            "error": "Cannot auto-join from t.me/c link without invite or membership",
         }
+
+    join_results = []
+    if allow_join and (join_possible or join_required):
+        for client in clients:
+            join_result = await _attempt_join(
+                client,
+                spec,
+                invite_link=invite_link,
+                username=target_username,
+                allow_join=allow_join,
+            )
+            join_results.append(join_result)
+        if any(result.get("ok") for result in join_results):
+            _FAILURE_CACHE.pop(spec.cache_key(), None)
+
+    fallback_result: dict[str, Any] | None = None
+    resolution_errors: dict[str, str | None] = {}
+
+    for client in clients:
+        session_name = getattr(client, "name", "client")
+        ok, chat, error = await _try_get_chat(client, spec)
+        if ok and chat:
+            chat_id = _chat_id_from_chat(chat)
+            result = {
+                "ok": True,
+                "kind": spec.kind,
+                "normalized": spec.normalized,
+                "chat_id": chat_id,
+                "message_ids": spec.message_ids,
+                "resolved_by": session_name,
+                "did_join": any(
+                    jr.get("session") == session_name and jr.get("status") in {"invite", "username", "already"}
+                    for jr in join_results
+                ),
+                "note": "resolved",
+                "error": None,
+            }
+            _cache_result(spec.cache_key(), result)
+            logging.info(
+                "ReportTargetResolver: resolved target",
+                extra={"session_name": session_name, "chat_id": chat_id, "kind": spec.kind},
+            )
+            return result
+
+        resolution_errors[session_name] = error
+
+        if error in {"PeerIdInvalid", "ChannelPrivate"}:
+            logging.info(
+                "ReportTargetResolver: membership error, trying next client",
+                extra={"session_name": session_name, "error": error},
+            )
+            continue
+
+        fallback_result = {
+            "ok": False,
+            "kind": spec.kind,
+            "normalized": spec.normalized,
+            "chat_id": None,
+            "message_ids": spec.message_ids,
+            "resolved_by": session_name,
+            "did_join": any(
+                jr.get("session") == session_name and jr.get("ok") for jr in join_results
+            ),
+            "note": "unresolved",
+            "error": error or "unknown_error",
+        }
+        if error == "FloodWait":
+            await _sleep_for_flood(1)
+        if fallback_result and fallback_result.get("error") not in {"PeerIdInvalid", "ChannelPrivate"}:
+            _cache_result(spec.cache_key(), fallback_result, failure=True)
+        return fallback_result
+
+    summary = ", ".join(f"{sess}:{err}" for sess, err in resolution_errors.items() if err)
+    result = fallback_result or {
+        "ok": False,
+        "kind": spec.kind,
+        "normalized": spec.normalized,
+        "chat_id": None,
+        "message_ids": spec.message_ids,
+        "resolved_by": None,
+        "did_join": any(jr.get("ok") for jr in join_results),
+        "note": "all_clients_failed",
+        "error": summary or "unresolved",
+    }
 
     if result.get("error") not in {"PeerIdInvalid", "ChannelPrivate"}:
         _cache_result(spec.cache_key(), result, failure=True)

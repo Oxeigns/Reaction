@@ -1425,6 +1425,15 @@ async def handle_private_invite(update: Update, context: ContextTypes.DEFAULT_TY
         "Joined successfully. Now send the private message link (https://t.me/c/123456789/45)",
         reply_markup=navigation_keyboard(),
     )
+    pending_link = flow_state(context).pop("pending_private_link", None)
+    if pending_link:
+        flow = flow_state(context)
+        flow["targets"] = [pending_link]
+        flow["target_kind"] = "private"
+        if await _resolve_and_preview_target(update, context, pending_link):
+            await update.effective_message.reply_text(REASON_PROMPT, reply_markup=reason_keyboard())
+            return REPORT_REASON_TYPE
+
     return PRIVATE_MESSAGE
 
 
@@ -1469,10 +1478,10 @@ async def handle_public_message_link(update: Update, context: ContextTypes.DEFAU
 
     message_link = maybe_parse_message_link(text)
     if message_link and getattr(message_link, "is_private", False):
+        flow_state(context)["pending_private_link"] = text
         flow_state(context)["target_kind"] = "private"
         await update.effective_message.reply_text(
-            "This appears to be a private t.me/c link.\n"
-            "Your account must be a member of the chat or join via invite link.\n\n"
+            "This is a private/internal message link. Please provide the chat invite link first.\n\n"
             "Send the private invite link (https://t.me/+code)",
             reply_markup=navigation_keyboard(show_back=False),
         )

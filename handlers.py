@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import logging
 import uuid
+from collections import deque
 from datetime import datetime
 from io import BytesIO
 from time import monotonic
@@ -790,6 +791,11 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
         failure_count = 0
         attempted = 0
         progress_message: Message | None = None
+        failure_logs: deque[str] = deque(maxlen=5)
+
+        def _record_failure(exc: Exception | str) -> None:
+            reason = exc if isinstance(exc, str) else f"{type(exc).__name__}: {exc}"
+            failure_logs.appendleft(f"Attempt {attempted + 1} failed due to {reason}")
 
         def _render_progress(status: str, end_label: str | None = None) -> str:
             progress_pct = 0 if requested_count == 0 else min(
@@ -817,6 +823,9 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
                 f"❌ Failed: {failure_count}",
                 f"🛰️ Progress: [{bar}] {progress_pct}%",
             ]
+            if failure_logs:
+                lines.append("❗ Recent failures:")
+                lines.extend(f"• {entry}" for entry in failure_logs)
             if end_label:
                 lines.append(f"🏁 End: {end_label}")
             lines.append("⚡ Keeping it sleek — edits are live and safe.")
@@ -849,14 +858,23 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
             )
             try:
                 await client.start()
-                await send_report(client, chat_ref, msg_id, reason_code, reason_text)
-                success_any = True
-                success_count += 1
+                try:
+                    ok = await send_report(
+                        client, chat_ref, msg_id, reason_code, reason_text
+                    )
+                    if ok:
+                        success_any = True
+                        success_count += 1
+                    else:
+                        failure_count += 1
+                        _record_failure("Send report call returned unsuccessful")
+                except RPCError as exc:
+                    failure_count += 1
+                    _record_failure(exc)
+                except Exception as exc:  # noqa: BLE001
+                    failure_count += 1
+                    _record_failure(exc)
                 await asyncio.sleep(1.5)
-            except RPCError:
-                failure_count += 1
-            except Exception:
-                failure_count += 1
             finally:
                 attempted += 1
                 if (
@@ -889,6 +907,7 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
         joined = 0
         failed = 0
         already_joined = 0
+        failure_reasons: deque[str] = deque(maxlen=5)
         for idx, session in enumerate(sessions):
             client = Client(
                 name=f"joiner_{idx}",
@@ -912,10 +931,16 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
                 await client.join_chat(target)
                 joined += 1
                 await asyncio.sleep(1)
-            except RPCError:
+            except RPCError as exc:
                 failed += 1
-            except Exception:
+                failure_reasons.append(
+                    f"Session {idx + 1}: {type(exc).__name__}: {exc}"
+                )
+            except Exception as exc:  # noqa: BLE001
                 failed += 1
+                failure_reasons.append(
+                    f"Session {idx + 1}: {type(exc).__name__}: {exc}"
+                )
             finally:
                 with contextlib.suppress(Exception):
                     await client.stop()
@@ -936,9 +961,20 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
             )
             return True
 
-        await message.reply_text("Could not join the target with any session. Please verify the link.")
+        detail_lines = ["Could not join the target with any session. Please verify the link."]
+        if failed:
+            detail_lines.append(f"❌ Failed joins: {failed}/{len(sessions)} sessions.")
+        if failure_reasons:
+            detail_lines.append("Recent errors:")
+            detail_lines.extend(f"• {reason}" for reason in failure_reasons)
+
+        await message.reply_text("\n".join(detail_lines))
         await _log_stage(
-            "Private Join Failed", f"User {message.from_user.id} failed to join {target}"
+            "Private Join Failed",
+            (
+                f"User {message.from_user.id} failed to join {target} "
+                f"({failed}/{len(sessions)} failed)"
+            ),
         )
         return False
 

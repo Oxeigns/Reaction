@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+from dataclasses import dataclass
 import re
 import uuid
 from typing import Iterable, Tuple
@@ -92,6 +93,54 @@ async def prune_sessions(persistence, *, announce: bool = False) -> list[str]:
         if announce:
             logging.warning("Removed %s invalid sessions", len(invalid))
     return valid
+
+
+@dataclass
+class SessionIdentity:
+    """Minimal identity details for a Pyrogram session."""
+
+    session: str
+    name: str
+    username: str | None
+    phone_number: str | None
+
+
+async def fetch_session_identity(session: str) -> SessionIdentity | None:
+    """Return the user identity fields for a session string, if accessible."""
+
+    s = (session or "").strip()
+    if not _looks_like_session_string(s):
+        return None
+
+    client = Client(
+        name=f"identity_{uuid.uuid4().hex}",
+        api_id=config.API_ID,
+        api_hash=config.API_HASH,
+        session_string=s,
+        in_memory=True,
+        no_updates=True,
+    )
+
+    try:
+        await client.start()
+        me = await client.get_me()
+        display_name = " ".join(filter(None, [getattr(me, "first_name", ""), getattr(me, "last_name", "")]))
+        display_name = display_name.strip() or "Unknown"
+        username = getattr(me, "username", None)
+        phone_number = getattr(me, "phone_number", None)
+        return SessionIdentity(session=s, name=display_name, username=username, phone_number=phone_number)
+    except FloodWait as e:
+        logging.warning("Session identity lookup hit FloodWait(%ss); skipping detail fetch.", getattr(e, "value", "?"))
+        return SessionIdentity(session=s, name="FloodWait", username=None, phone_number=None)
+    except RPCError as e:
+        logging.warning("Session identity RPCError: %s", e.__class__.__name__)
+        return None
+    except Exception as e:  # noqa: BLE001
+        logging.warning("Session identity lookup failed: %s", e.__class__.__name__)
+        return None
+    finally:
+        with contextlib.suppress(Exception):
+            await client.stop()
 
 
 def extract_sessions_from_text(text: str) -> list[str]:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import uuid
 from io import BytesIO
 from time import monotonic
 from typing import Callable, Tuple
@@ -12,12 +13,18 @@ from typing import Callable, Tuple
 from pyrogram import Client, filters
 from pyrogram.enums import ChatMemberStatus
 from pyrogram.errors import RPCError
-from pyrogram.types import CallbackQuery, Message
+from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 import config
 from logging_utils import log_error, log_report_summary, log_user_start, send_log
 from report import send_report
-from session_bot import extract_sessions_from_text, prune_sessions, validate_session_string
+from session_bot import (
+    SessionIdentity,
+    extract_sessions_from_text,
+    fetch_session_identity,
+    prune_sessions,
+    validate_session_string,
+)
 from state import QueueEntry, ReportQueue, StateManager
 from sudo import is_owner
 from ui import (
@@ -70,6 +77,7 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
         await log_error(app, await persistence.get_logs_group_id(), exc, config.OWNER_ID)
 
     queue.set_error_handler(_queue_error)
+    session_tokens: dict[str, str] = {}
 
     async def _log_stage(stage: str, detail: str) -> None:
         await send_log(
@@ -358,6 +366,39 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
     async def manage_sessions(_: Client, query: CallbackQuery) -> None:
         await _wrap_errors(_handle_owner_manage, query)
 
+    async def _render_session_detail_rows(sessions: list[str]) -> tuple[str, InlineKeyboardMarkup]:
+        session_tokens.clear()
+        lines: list[str] = []
+        buttons: list[list[InlineKeyboardButton]] = []
+        for idx, session in enumerate(sessions, start=1):
+            identity: SessionIdentity | None = await fetch_session_identity(session)
+            name = identity.name if identity else "Unknown"
+            username = identity.username if identity else None
+            phone = identity.phone_number if identity else None
+            parts = [f"{idx}. {name}"]
+            if username:
+                parts.append(f"@{username}")
+            if phone:
+                parts.append(phone)
+            lines.append(" | ".join(parts))
+
+            token = uuid.uuid4().hex[:12]
+            session_tokens[token] = session
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        f"❌ Remove {idx}", callback_data=f"owner:remove:{token}"
+                    )
+                ]
+            )
+
+        if not lines:
+            lines.append("No valid sessions found after validation.")
+
+        buttons.append([InlineKeyboardButton("🔄 Refresh", callback_data="owner:manage")])
+        keyboard = InlineKeyboardMarkup(buttons)
+        return "\n".join(lines), keyboard
+
     @app.on_callback_query(filters.regex(r"^owner:set_session_group$"))
     async def owner_session_hint(_: Client, query: CallbackQuery) -> None:
         await _wrap_errors(_handle_owner_session_hint, query)
@@ -407,10 +448,43 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
         if not query.from_user or not is_owner(query.from_user.id):
             await query.answer("Owner only", show_alert=True)
             return
-        sessions = await persistence.get_sessions()
-        await query.message.reply_text(f"Currently stored sessions: {len(sessions)}")
+        checking = await query.message.reply_text("🔎 Checking saved sessions...")
+        sessions = await _sessions_available()
+        detail_text, keyboard = await _render_session_detail_rows(sessions)
+        await checking.edit_text(
+            f"Currently stored sessions: {len(sessions)}\n\n{detail_text}",
+            reply_markup=keyboard,
+        )
         await _log_stage("Owner Manage", f"Owner checked sessions ({len(sessions)})")
         await query.answer()
+
+    @app.on_callback_query(filters.regex(r"^owner:remove:(?P<token>[A-Za-z0-9]+)$"))
+    async def owner_remove_session(_: Client, query: CallbackQuery) -> None:
+        await _wrap_errors(_handle_owner_remove_session, query)
+
+    async def _handle_owner_remove_session(query: CallbackQuery) -> None:
+        if not query.from_user or not is_owner(query.from_user.id):
+            await query.answer("Owner only", show_alert=True)
+            return
+
+        token = query.matches[0].group("token") if query.matches else None
+        session = session_tokens.get(token or "")
+        if not session:
+            await query.answer("Session mapping expired. Refresh the list.", show_alert=True)
+            return
+
+        removed = await persistence.remove_sessions([session])
+        session_tokens.pop(token, None)
+        if removed:
+            await query.answer("Session removed", show_alert=True)
+            await query.message.reply_text("✅ Session removed from storage.")
+            remaining = len(await persistence.get_sessions())
+            await _log_stage(
+                "Session Removed",
+                f"Owner removed a session. Remaining: {remaining}",
+            )
+        else:
+            await query.answer("Session not found", show_alert=True)
 
     async def _handle_owner_session_hint(query: CallbackQuery) -> None:
         if not query.from_user or not is_owner(query.from_user.id):
@@ -689,6 +763,13 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
                 "total_sessions": 0,
                 "requested": requested_count,
             }
+
+        await message.reply_text(
+            (
+                f"Using all {total_sessions} valid sessions in rotation "
+                f"until {requested_count} report attempts are completed."
+            )
+        )
 
         await _log_stage(
             "Report Started", f"User {message.from_user.id} executing with {len(sessions)} sessions"

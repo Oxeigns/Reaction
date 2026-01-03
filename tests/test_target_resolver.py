@@ -49,6 +49,11 @@ class ParseTargetTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_target("https://t.me/")
 
+    def test_numeric_target_with_query(self) -> None:
+        parsed = parse_target("-1003212957686?start=bot")
+        self.assertEqual(parsed.kind, "numeric")
+        self.assertEqual(parsed.numeric_id, -1003212957686)
+
 
 if __name__ == "__main__":
     unittest.main()

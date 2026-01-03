@@ -153,7 +153,7 @@ def parse_target(raw_input: str) -> TargetSpec:
         )
 
     # Numeric IDs (-100..., user id, etc.)
-    numeric_candidate = raw.replace(" ", "")
+    numeric_candidate = cleaned.replace(" ", "")
     if numeric_candidate.startswith("http://") or numeric_candidate.startswith("https://"):
         numeric_candidate = numeric_candidate.split("://", 1)[1]
     if numeric_candidate.startswith("t.me/"):

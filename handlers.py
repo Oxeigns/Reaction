@@ -868,6 +868,44 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
         failure_count = 0
         attempted = 0
         progress_message: Message | None = None
+        preparing_message: Message | None = None
+        stop_preparing = asyncio.Event()
+        spinner_frames = [
+            "[■□□□□□□□□□]",
+            "[■■□□□□□□□□]",
+            "[■■■□□□□□□□]",
+            "[■■■■□□□□□□]",
+            "[■■■■■□□□□□]",
+            "[■■■■■■□□□□]",
+            "[■■■■■■■□□□]",
+            "[■■■■■■■■□□]",
+            "[■■■■■■■■■□]",
+            "[■■■■■■■■■■]",
+        ]
+
+        async def _animate_preparing() -> None:
+            """Show a lightweight spinner while the backend warms up."""
+
+            nonlocal preparing_message
+            frame_idx = 0
+            if not preparing_message:
+                with contextlib.suppress(Exception):
+                    preparing_message = await message.reply_text(
+                        "⚙️ Processing your report request...\n"
+                        "<code>Booting reporting engine</code>"
+                    )
+
+            while not stop_preparing.is_set() and preparing_message:
+                frame = spinner_frames[frame_idx % len(spinner_frames)]
+                frame_idx += 1
+                with contextlib.suppress(Exception):
+                    await preparing_message.edit_text(
+                        "⚙️ Processing your report request...\n"
+                        f"<code>{frame} initializing secure uplink</code>"
+                    )
+                await asyncio.sleep(0.8)
+
+        prepare_task = asyncio.create_task(_animate_preparing())
         failure_logs: deque[str] = deque(maxlen=5)
 
         def _record_failure(exc: Exception | str) -> None:
@@ -909,6 +947,9 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
             return "\n".join(lines)
 
         with contextlib.suppress(Exception):
+            stop_preparing.set()
+            with contextlib.suppress(Exception):
+                await prepare_task
             progress_message = await message.reply_text(
                 (
                     f"Using all {total_sessions} valid sessions in rotation "
@@ -916,6 +957,10 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
                     + _render_progress("🛠️ Initializing...")
                 )
             )
+
+        if preparing_message and progress_message:
+            with contextlib.suppress(Exception):
+                await preparing_message.delete()
 
         async def _update_progress(status: str, end_label: str | None = None) -> None:
             if not progress_message:
@@ -935,6 +980,16 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
             )
             try:
                 await client.start()
+                try:
+                    # Ensure the chat is cached for this session so Telegram can
+                    # resolve the peer during reporting.
+                    await client.get_chat(chat_ref)
+                except Exception as exc:  # noqa: BLE001
+                    ok = False
+                    failure_count += 1
+                    _record_failure(exc)
+                    continue
+
                 try:
                     ok = await send_report(
                         client, chat_ref, msg_id, reason_code, reason_text

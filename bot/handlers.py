@@ -40,7 +40,7 @@ from bot.constants import (
     TARGET_KIND,
 )
 from bot.dependencies import API_HASH, API_ID, data_store
-from bot.link_parser import maybe_parse_message_link, parse_join_target
+from bot.link_parser import maybe_parse_message_link, parse_access_link
 from bot.target_resolver import (
     TargetDetails,
     ensure_join_if_needed,
@@ -446,7 +446,11 @@ async def _join_target_with_client(client, parsed_link, status_callback, *, max_
     from pyrogram.errors import FloodWait, RPCError, UserAlreadyParticipant
 
     me = await client.get_me()
-    join_target = parsed_link.normalized_url if parsed_link.type == "invite" else parsed_link.username or parsed_link.normalized_url
+    join_target = (
+        parsed_link.normalized
+        if getattr(parsed_link, "kind", None) == "invite_hash"
+        else getattr(parsed_link, "username", None) or getattr(parsed_link, "normalized", None)
+    )
     join_target = join_target.lstrip("@") if isinstance(join_target, str) else join_target
 
     for attempt in range(1, max_attempts + 1):
@@ -508,10 +512,10 @@ def _attach_invite(spec, invite_link: str | None):
 
 async def _join_and_report(update: Update, context: ContextTypes.DEFAULT_TYPE, link_text: str):
     try:
-        parsed_link = parse_join_target(link_text)
+        parsed_link = parse_access_link(link_text)
     except Exception:
         await update.effective_message.reply_text(
-            "Please send a valid invite link or public @username (https://t.me/+code or @channel)",
+            "Please send a valid chat access link (https://t.me/+invite, https://t.me/joinchat/code, or @username).",
             reply_markup=navigation_keyboard(),
         )
         return None
@@ -550,7 +554,7 @@ async def _join_and_report(update: Update, context: ContextTypes.DEFAULT_TYPE, l
 
     chat = result.get("chat")
     if chat:
-        flow_state(context)["invite_link"] = parsed_link.normalized_url if parsed_link.type == "invite" else None
+        flow_state(context)["invite_link"] = parsed_link.normalized if parsed_link.kind == "invite_hash" else None
         title = getattr(chat, "title", None) or getattr(chat, "first_name", None) or parsed_link.username or "chat"
         await update.effective_message.reply_text(
             f"✅ Joined successfully: {title} ({getattr(chat, 'id', 'unknown')})",

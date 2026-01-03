@@ -17,6 +17,24 @@ class ParsedTelegramLink:
 
 
 @dataclass(frozen=True, slots=True)
+class ParsedAccessLink:
+    """Normalized chat access link accepted by the unified flow.
+
+    Only two shapes are allowed:
+    - ``invite_hash`` for private joins (``https://t.me/+<hash>`` or ``joinchat/<hash>``)
+    - ``username`` for public joins (``https://t.me/<username>`` or ``@username``)
+
+    Message links or other paths are rejected up-front so invite hashes are
+    never routed through username resolution.
+    """
+
+    kind: Literal["invite_hash", "public_username"]
+    normalized: str
+    invite_hash: str | None = None
+    username: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class ParsedMessageLink:
     raw: str
     normalized_url: str
@@ -55,6 +73,81 @@ def _parse_invite_hash_from_url(parsed) -> str | None:
         if first.lower() == "joinchat" and len(path_parts) >= 2:
             return path_parts[1] or None
     return None
+
+
+def parse_access_link(raw: str) -> ParsedAccessLink:
+    """Parse chat access link for unified join flow.
+
+    Accepted inputs:
+    - https://t.me/+<hash>
+    - https://t.me/joinchat/<hash>
+    - @username or https://t.me/<username>
+
+    Message links (with a message id), t.me/c internal links, or any other
+    extra path segments are rejected to avoid misrouting invite hashes through
+    username resolution.
+    """
+
+    cleaned = _clean_input(raw)
+    if not cleaned:
+        raise ValueError("Empty chat access link")
+
+    if " " in cleaned:
+        raise ValueError("Links or usernames cannot contain spaces")
+
+    if cleaned.startswith("+"):
+        invite_hash = cleaned.lstrip("+")
+        if not invite_hash:
+            raise ValueError("Invite hash is missing")
+        return ParsedAccessLink(
+            kind="invite_hash",
+            normalized=f"https://t.me/+{invite_hash}",
+            invite_hash=invite_hash,
+        )
+
+    if cleaned.startswith("@"):
+        username = cleaned.lstrip("@")
+        if not username:
+            raise ValueError("Username is missing")
+        return ParsedAccessLink(
+            kind="public_username",
+            normalized=f"https://t.me/{username}",
+            username=username,
+        )
+
+    parsed = urlparse(_ensure_scheme(cleaned))
+    path_parts = [p for p in parsed.path.split("/") if p]
+
+    invite_hash = _parse_invite_hash_from_url(parsed)
+    if invite_hash:
+        return ParsedAccessLink(
+            kind="invite_hash",
+            normalized=f"https://t.me/+{invite_hash}",
+            invite_hash=invite_hash,
+        )
+
+    if parsed.netloc and parsed.netloc.endswith("t.me"):
+        if not path_parts:
+            raise ValueError("The t.me link is missing a username")
+
+        if len(path_parts) > 1:
+            raise ValueError("Message links are not allowed here; send chat link only")
+
+        username = path_parts[0].lstrip("@")
+        if not username:
+            raise ValueError("Username is missing")
+        return ParsedAccessLink(
+            kind="public_username",
+            normalized=f"https://t.me/{username}",
+            username=username,
+        )
+
+    # Bare username fallback
+    return ParsedAccessLink(
+        kind="public_username",
+        normalized=f"https://t.me/{cleaned.lstrip('@')}",
+        username=cleaned.lstrip("@"),
+    )
 
 
 def parse_join_target(raw: str) -> ParsedTelegramLink:
@@ -195,6 +288,13 @@ def maybe_parse_message_link(raw: str) -> ParsedMessageLink | None:
         return None
 
 
+def maybe_parse_access_link(raw: str) -> ParsedAccessLink | None:
+    try:
+        return parse_access_link(raw)
+    except Exception:
+        return None
+
+
 def maybe_parse_join_target(raw: str) -> ParsedTelegramLink | None:
     try:
         return parse_join_target(raw)
@@ -205,8 +305,11 @@ def maybe_parse_join_target(raw: str) -> ParsedTelegramLink | None:
 __all__ = [
     "ParsedTelegramLink",
     "ParsedMessageLink",
+    "ParsedAccessLink",
     "parse_join_target",
     "maybe_parse_join_target",
+    "parse_access_link",
+    "maybe_parse_access_link",
     "parse_message_link",
     "maybe_parse_message_link",
 ]

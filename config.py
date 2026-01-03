@@ -69,8 +69,8 @@ ADMIN_IDS: Final[set[int]] = (
 )
 
 # Primary authority for the bot.
-# This value is intentionally hard-coded to avoid accidental privilege changes.
-OWNER_ID: Final[int] = 1888832817
+# Falls back to a hardcoded value when not supplied by the environment.
+OWNER_ID: Final[int] = int(os.getenv("OWNER_ID", "123456789"))
 
 # Optional sudo users (reporters / helpers)
 SUDO_USERS: Final[set[int]] = (

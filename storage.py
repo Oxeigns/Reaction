@@ -204,9 +204,9 @@ class DataStore:
     # ------------------- Sudo users -------------------
     async def add_sudo_user(self, user_id: int) -> None:
         self._sudo_users.add(user_id)
-        config.SUDO_USERS.add(user_id)
         if self.db:
             await self.db.sudo.update_one({"_id": user_id}, {"$set": {}}, upsert=True)
+        config.SUDO_USERS.add(user_id)
         self._persist_snapshot()
 
     async def remove_sudo_user(self, user_id: int) -> None:
@@ -218,9 +218,9 @@ class DataStore:
 
     async def get_sudo_users(self) -> set[int]:
         if self.db:
-            users = await self.db.sudo.find().to_list(length=None)
+            users = await self.db.sudo.find().to_list(None)
             if users:
-                return set(u.get("_id") for u in users if "_id" in u)
+                return {u["_id"] for u in users if "_id" in u}
         return set(self._sudo_users)
 
     async def known_chats(self) -> list[int]:

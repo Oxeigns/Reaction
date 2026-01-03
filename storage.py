@@ -27,10 +27,11 @@ class DataStore:
         self.mongo_uri = mongo_uri or os.getenv(self.mongo_env_var, "")
         self._in_memory_sessions: set[str] = set()
         self._in_memory_reports: list[dict] = []
-        self._in_memory_config: dict[str, int | None] = {
+        self._config_defaults: dict[str, int | None] = {
             "session_group": config.SESSION_GROUP_ID,
             "logs_group": config.LOGS_GROUP_ID,
         }
+        self._in_memory_config: dict[str, int | None] = dict(self._config_defaults)
         self._in_memory_chats: set[int] = set()
         self._snapshot_path: Path | None = None
 
@@ -161,8 +162,11 @@ class DataStore:
     async def _get_config_value(self, key: str) -> int | None:
         if self.db:
             doc = await self.db.config.find_one({"_id": "config"}, {"_id": False, key: True})
-            return doc.get(key) if doc else None
-        return self._in_memory_config.get(key)
+            if doc and key in doc:
+                return doc.get(key)
+        if key in self._in_memory_config:
+            return self._in_memory_config.get(key)
+        return self._config_defaults.get(key)
 
     # ------------------- Known chats -------------------
     async def add_known_chat(self, chat_id: int) -> None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+import logging
 from time import monotonic
 from typing import Awaitable, Callable, Dict, Optional
 
@@ -63,10 +64,16 @@ class ReportQueue:
         self._queue: asyncio.Queue[QueueEntry] = asyncio.Queue()
         self._worker: Optional[asyncio.Task] = None
         self._active_user: Optional[int] = None
+        self._on_error: Optional[Callable[[Exception], Awaitable[None]]] = None
 
     @property
     def active_user(self) -> Optional[int]:
         return self._active_user
+
+    def set_error_handler(self, handler: Callable[[Exception], Awaitable[None]]) -> None:
+        """Register a coroutine to run when a queued job raises."""
+
+        self._on_error = handler
 
     def expected_position(self, user_id: int) -> int:
         # position is 1-based; include active job when not same user
@@ -88,9 +95,10 @@ class ReportQueue:
             self._active_user = entry.user_id
             try:
                 await entry.job()
-            except Exception:
-                # errors are handled in job; avoid crashing worker
-                pass
+            except Exception as exc:  # noqa: BLE001
+                logging.exception("Queue worker error")
+                if self._on_error:
+                    await self._on_error(exc)
             finally:
                 self._active_user = None
                 self._queue.task_done()

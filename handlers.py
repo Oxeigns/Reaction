@@ -462,11 +462,14 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
         session_group = await persistence.get_session_group_id()
         if message.chat.id != session_group:
             return
-        if not message.from_user or not is_owner(message.from_user.id):
+        if not message.from_user:
             return
 
         await message.reply_text("📥 Bot received your message.")
-        await _log_stage("Session Intake", f"Message captured in session group {message.chat.id}")
+        await _log_stage(
+            "Session Intake",
+            f"Message captured in session group {message.chat.id} from {message.from_user.id}",
+        )
 
         text_content = message.text or message.caption or ""
         sessions = extract_sessions_from_text(text_content)

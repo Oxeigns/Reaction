@@ -27,7 +27,9 @@ class TargetSpec:
 
     @property
     def requires_join(self) -> bool:
-        return self.kind == "invite" or bool(self.invite_hash or self.invite_link)
+        return self.kind in {"invite", "internal_message"} or bool(
+            self.invite_hash or self.invite_link
+        )
 
 
 @dataclass
@@ -72,6 +74,9 @@ _CACHE: dict[str, tuple[ResolvedTarget, datetime]] = {}
 _CACHE_TTL = timedelta(minutes=10)
 _FAILURE_CACHE: dict[str, tuple[ResolvedTarget, datetime]] = {}
 _FAILURE_TTL = timedelta(minutes=5)
+_JOIN_SUCCESS_TTL = timedelta(minutes=5)
+# (session_name, target_cache_key) -> expiry
+_JOIN_CACHE: dict[tuple[str, str], datetime] = {}
 _FATAL_ERRORS = {
     "UsernameInvalid",
     "UsernameNotOccupied",
@@ -227,29 +232,53 @@ async def ensure_join_if_needed(client: Any, target_spec: TargetSpec) -> JoinRes
         else None
     )
 
-    if not target_spec.invite_link and not target_spec.invite_hash:
+    join_cache: dict[tuple[str, str], datetime] = _JOIN_CACHE
+    session_name = getattr(client, "name", "client")
+    cache_key = (session_name, target_spec.cache_key())
+
+    now = datetime.now(timezone.utc)
+    cached_entry = join_cache.get(cache_key)
+    if cached_entry and cached_entry > now:
+        return JoinResult(ok=True, joined=False, reason="cached", chat_id=expected_chat_id)
+
+    invite_link = target_spec.invite_link or (
+        f"https://t.me/+{target_spec.invite_hash}" if target_spec.invite_hash else None
+    )
+
+    if not invite_link and not target_spec.username:
+        if target_spec.kind == "internal_message":
+            return JoinResult(
+                ok=False,
+                joined=False,
+                reason="invite_required",
+                error="Cannot auto-join internal chat without invite or username",
+                chat_id=expected_chat_id,
+            )
         _FAILURE_CACHE.pop(target_spec.cache_key(), None)
         return JoinResult(ok=True, joined=False, chat_id=expected_chat_id)
 
-    invite_link = target_spec.invite_link or f"https://t.me/+{target_spec.invite_hash}"
-    attempts = 0
-    while attempts < 3:
-        attempts += 1
+    async def _attempt_join_once() -> JoinResult:
         try:
-            chat = await client.join_chat(invite_link)
+            if invite_link:
+                chat = await client.join_chat(invite_link)
+                method = "invite"
+            else:
+                chat = await client.join_chat(target_spec.username)
+                method = "username"
             logging.info(
-                "TargetResolver: joined invite",
+                "TargetResolver: joined chat",
                 extra={
-                    "invite_link": invite_link,
-                    "session_name": getattr(client, "name", "client"),
+                    "join_method": method,
+                    "join_target": invite_link or target_spec.username,
+                    "session_name": session_name,
                     "step": "ensure_join",
-                    "attempt": attempts,
                 },
             )
             chat_id = _chat_id_from_chat(chat)
             title = getattr(chat, "title", None) or getattr(chat, "first_name", None)
             join_result = JoinResult(ok=True, joined=True, chat_id=chat_id, title=title)
             _FAILURE_CACHE.pop(target_spec.cache_key(), None)
+            join_cache[cache_key] = datetime.now(timezone.utc) + _JOIN_SUCCESS_TTL
             if (
                 expected_chat_id is not None
                 and join_result.chat_id is not None
@@ -268,15 +297,17 @@ async def ensure_join_if_needed(client: Any, target_spec: TargetSpec) -> JoinRes
             logging.info(
                 "TargetResolver: already participant",
                 extra={
-                    "invite_link": invite_link,
-                    "session_name": getattr(client, "name", "client"),
+                    "join_target": invite_link or target_spec.username,
+                    "session_name": session_name,
                     "step": "ensure_join",
                 },
             )
-            chat = await client.get_chat(invite_link)
+            chat_ref = invite_link or target_spec.username
+            chat = await client.get_chat(chat_ref)
             chat_id = _chat_id_from_chat(chat)
             title = getattr(chat, "title", None) or getattr(chat, "first_name", None)
             _FAILURE_CACHE.pop(target_spec.cache_key(), None)
+            join_cache[cache_key] = datetime.now(timezone.utc) + _JOIN_SUCCESS_TTL
             return JoinResult(
                 ok=True,
                 joined=False,
@@ -285,26 +316,26 @@ async def ensure_join_if_needed(client: Any, target_spec: TargetSpec) -> JoinRes
                 title=title,
             )
         except FloodWait as fw:
+            wait_seconds = int(getattr(fw, "value", 0) or 0)
             logging.warning(
-                "Flood wait %ss while joining %s (attempt %s)",
-                getattr(fw, "value", 0),
-                invite_link,
-                attempts,
+                "Flood wait %ss while joining %s",
+                wait_seconds,
+                invite_link or target_spec.username,
             )
-            retry_after = int(getattr(fw, "value", 0) or 0)
+            await asyncio.sleep(wait_seconds or 1)
             return JoinResult(
                 ok=False,
                 joined=False,
                 reason="flood_wait",
                 error=str(fw),
-                retry_after=retry_after,
+                retry_after=wait_seconds or None,
             )
         except (InviteHashInvalid, InviteHashExpired) as exc:
             logging.error(
                 "TargetResolver: invalid invite",
                 extra={
                     "invite_link": invite_link,
-                    "session_name": getattr(client, "name", "client"),
+                    "session_name": session_name,
                     "step": "ensure_join",
                     "error": exc.__class__.__name__,
                 },
@@ -313,32 +344,37 @@ async def ensure_join_if_needed(client: Any, target_spec: TargetSpec) -> JoinRes
         except ChatAdminRequired as exc:
             return JoinResult(ok=False, joined=False, reason="admin_required", error=str(exc))
         except RPCError as exc:
-            # Retry transient RPC errors once with a short delay.
             logging.warning(
                 "TargetResolver: transient join failure",
                 extra={
-                    "invite_link": invite_link,
-                    "session_name": getattr(client, "name", "client"),
+                    "join_target": invite_link or target_spec.username,
+                    "session_name": session_name,
                     "step": "ensure_join",
                     "error": exc.__class__.__name__,
-                    "attempt": attempts,
                 },
             )
-            await asyncio.sleep(min(5, attempts))
-            continue
+            return JoinResult(ok=False, joined=False, reason="join_failed", error=str(exc))
         except Exception as exc:  # noqa: BLE001
             logging.exception(
                 "TargetResolver: unexpected join failure",
                 extra={
-                    "invite_link": invite_link,
-                    "session_name": getattr(client, "name", "client"),
+                    "join_target": invite_link or target_spec.username,
+                    "session_name": session_name,
                     "step": "ensure_join",
                     "error": exc.__class__.__name__,
                 },
             )
             return JoinResult(ok=False, joined=False, reason="join_failed", error=str(exc))
 
-    return JoinResult(ok=False, joined=False, reason="join_exhausted", error="join attempts exceeded")
+    first = await _attempt_join_once()
+    if first.reason == "flood_wait" and first.retry_after:
+        await asyncio.sleep(first.retry_after)
+        second = await _attempt_join_once()
+        if second.ok:
+            return second
+        return first if first.retry_after else second
+
+    return first
 
 
 async def ensure_joined(client: Any, target_spec: TargetSpec) -> JoinResult:
@@ -552,8 +588,19 @@ def _purge_cache() -> None:
     for key in stale_failures:
         _FAILURE_CACHE.pop(key, None)
 
+    stale_joins: list[tuple[str, str]] = []
+    for key, expires_at in _JOIN_CACHE.items():
+        if expires_at <= now:
+            stale_joins.append(key)
+    for key in stale_joins:
+        _JOIN_CACHE.pop(key, None)
+
 
 def _cache_resolution(target_spec: TargetSpec, resolved: ResolvedTarget, *, failure: bool = False) -> None:
+    membership_errors = {"PeerIdInvalid", "ChannelPrivate"}
+    if failure and resolved.error in membership_errors:
+        return
+
     ttl = _FAILURE_TTL if failure else _CACHE_TTL
     cache = _FAILURE_CACHE if failure else _CACHE
     cache[target_spec.cache_key()] = (resolved, datetime.now(timezone.utc) + ttl)

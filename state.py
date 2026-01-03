@@ -18,6 +18,7 @@ class UserState:
     target_link: Optional[str] = None
     reason_code: Optional[int] = None
     reason_text: Optional[str] = None
+    report_count: Optional[int] = None  # 🔧 NEW: Number of reports
     started_at: float = field(default_factory=monotonic)
 
     def reset(self) -> None:
@@ -26,6 +27,7 @@ class UserState:
         self.target_link = None
         self.reason_code = None
         self.reason_text = None
+        self.report_count = None  # 🔧 Clear report count
         self.started_at = monotonic()
 
 
@@ -105,4 +107,3 @@ class ReportQueue:
 
     def is_busy(self) -> bool:
         return bool(self._active_user) or not self._queue.empty()
-

@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import logging
 import uuid
+from datetime import datetime
 from io import BytesIO
 from time import monotonic
 from typing import Callable, Tuple
@@ -32,7 +33,6 @@ from ui import (
     owner_panel,
     queued_message,
     reason_keyboard,
-    report_count_keyboard,
     report_type_keyboard,
     sudo_panel,
 )
@@ -94,9 +94,8 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
         await message.reply_text(
             (
                 "How many reports do you want to send? "
-                f"Choose between {config.MIN_REPORTS} and {config.MAX_REPORTS}."
-            ),
-            reply_markup=report_count_keyboard(),
+                f"Send a number between {config.MIN_REPORTS} and {config.MAX_REPORTS}."
+            )
         )
 
     async def _apply_report_count(message: Message, state, count: int) -> None:
@@ -764,17 +763,6 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
                 "requested": requested_count,
             }
 
-        await message.reply_text(
-            (
-                f"Using all {total_sessions} valid sessions in rotation "
-                f"until {requested_count} report attempts are completed."
-            )
-        )
-
-        await _log_stage(
-            "Report Started", f"User {message.from_user.id} executing with {len(sessions)} sessions"
-        )
-
         try:
             chat_ref, msg_id = _parse_link(state.target_link, state.report_type == "private")
         except ValueError:
@@ -788,12 +776,68 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
                 "requested": requested_count,
             }
 
+        await _log_stage(
+            "Report Started", f"User {message.from_user.id} executing with {len(sessions)} sessions"
+        )
+
+        started_at = datetime.utcnow()
+        start_label = started_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+
         reason_code = state.reason_code if state.reason_code is not None else 9
         reason_text = state.reason_text or "Report"
         success_any = False
         success_count = 0
         failure_count = 0
         attempted = 0
+        progress_message: Message | None = None
+
+        def _render_progress(status: str, end_label: str | None = None) -> str:
+            progress_pct = 0 if requested_count == 0 else min(
+                100, int((attempted / requested_count) * 100)
+            )
+            bar_width = 20
+            filled = min(bar_width, max(0, int(bar_width * progress_pct / 100)))
+            bar = "█" * filled + "░" * (bar_width - filled)
+            elapsed = int(monotonic() - state.started_at)
+            mode = "Private Group/Channel" if state.report_type == "private" else "Public Group/Channel"
+            lines = [
+                "💻 Live Attempts Panel",
+                "━━━━━━━━━━━━━━━━━━",
+                f"🛰️ Status: {status}",
+                f"🗂️ Report Type: {reason_text}",
+                f"📡 Group Type: {mode}",
+                f"🔗 Link: {state.target_link}",
+                f"🎯 Target Link: {state.target_link}",
+                f"🕒 Start: {start_label}",
+                f"⏱️ Elapsed: {elapsed}s",
+                f"📦 Sessions: {total_sessions}",
+                f"🧮 Requested: {requested_count}",
+                f"🚀 Attempts: {attempted}/{requested_count}",
+                f"✅ Successful: {success_count}",
+                f"❌ Failed: {failure_count}",
+                f"🛰️ Progress: [{bar}] {progress_pct}%",
+            ]
+            if end_label:
+                lines.append(f"🏁 End: {end_label}")
+            lines.append("⚡ Keeping it sleek — edits are live and safe.")
+            return "\n".join(lines)
+
+        with contextlib.suppress(Exception):
+            progress_message = await message.reply_text(
+                (
+                    f"Using all {total_sessions} valid sessions in rotation "
+                    f"until {requested_count} report attempts are completed.\n\n"
+                    + _render_progress("🛠️ Initializing...")
+                )
+            )
+
+        async def _update_progress(status: str, end_label: str | None = None) -> None:
+            if not progress_message:
+                return
+            with contextlib.suppress(Exception):
+                await progress_message.edit_text(_render_progress(status, end_label=end_label))
+
+        update_interval = 2
         while attempted < requested_count and total_sessions:
             session = sessions[attempted % total_sessions]
             client = Client(
@@ -815,8 +859,18 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
                 failure_count += 1
             finally:
                 attempted += 1
+                if (
+                    attempted == 1
+                    or attempted == requested_count
+                    or attempted % update_interval == 0
+                ):
+                    await _update_progress("⚡ Running live...")
                 with contextlib.suppress(Exception):
                     await client.stop()
+
+        final_label = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+        final_status = "✅ Completed" if success_any else "❌ Completed"
+        await _update_progress(final_status, end_label=final_label)
         return {
             "any_success": success_any,
             "success_count": success_count,

@@ -31,6 +31,34 @@ from ui import (
 )
 
 
+MIN_REPORTS = 500
+MAX_REPORTS = 10000
+
+
+def _clamp_report_count(requested: int) -> tuple[int, list[str]]:
+    """Clamp requested reports within allowed range and return notes."""
+
+    notes: list[str] = []
+    count = requested
+    if count < MIN_REPORTS:
+        count = MIN_REPORTS
+        notes.append(f"Minimum report count is {MIN_REPORTS}.")
+    if count > MAX_REPORTS:
+        count = MAX_REPORTS
+        notes.append(f"Maximum report count is {MAX_REPORTS}.")
+    return count, notes
+
+
+def _finalize_report_count(requested: int, available_sessions: int) -> tuple[int, list[str]]:
+    """Clamp requested count and cap it to available sessions."""
+
+    count, notes = _clamp_report_count(requested)
+    if available_sessions and count > available_sessions:
+        count = available_sessions
+        notes.append(f"Using all available valid sessions ({available_sessions}).")
+    return count, notes
+
+
 def _normalize_chat_id(value) -> int | None:
     if value is None:
         return None
@@ -461,13 +489,15 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
             await query.answer()
             return
         try:
-            count = int(query.data.rsplit(":", 1)[-1])
+            requested = int(query.data.rsplit(":", 1)[-1])
         except ValueError:
             await query.answer("Invalid selection", show_alert=True)
             return
 
+        count, notes = _clamp_report_count(requested)
         state.report_count = count
-        await query.message.reply_text(f"✅ Will send {count} reports.")
+        note_lines = notes + [f"✅ Will send {count} reports."]
+        await query.message.reply_text("\n".join(note_lines))
         await _begin_report(query.message, state)
         await query.answer()
 
@@ -513,14 +543,16 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
 
         if state.stage == "awaiting_count":
             try:
-                count = int(message.text.strip())
-                if count <= 0:
-                    raise ValueError()
+                requested = int(message.text.strip())
+                count, notes = _clamp_report_count(requested)
                 state.report_count = count
-                await message.reply_text(f"✅ Will send {count} reports.")
+                note_lines = notes + [f"✅ Will send {count} reports."]
+                await message.reply_text("\n".join(note_lines))
                 await _begin_report(message, state)
             except ValueError:
-                await message.reply_text("Please enter a valid number of reports (e.g., 10).")
+                await message.reply_text(
+                    f"Please enter a valid number between {MIN_REPORTS} and {MAX_REPORTS}."
+                )
             return
 
         if state.stage == "awaiting_reason_text":
@@ -634,12 +666,10 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
         reason_text = state.reason_text or "Report"
         success_any = False
 
-        count = state.report_count or 10
-        if count > len(sessions):
-            count = len(sessions)
-            await message.reply_text(
-                f"Only {count} sessions available; adjusting report count accordingly."
-            )
+        requested = state.report_count or MIN_REPORTS
+        count, notes = _finalize_report_count(requested, len(sessions))
+        if notes:
+            await message.reply_text("\n".join(notes))
 
         for idx, session in enumerate(sessions[:count]):
             client = Client(

@@ -26,8 +26,8 @@ async def log_user_start(client: Client, logs_group: int | None, message) -> Non
     if not logs_group or not message.from_user:
         return
     text = (
-        "📥 New User Started Bot\n"
-        f"👤 [{message.from_user.first_name}](tg://user?id={message.from_user.id})\n"
+        "📥 New user started the bot\n"
+        f"👤 {message.from_user.first_name}\n"
         f"🆔 ID: {message.from_user.id}"
     )
     await send_log(client, logs_group, text, parse_mode="markdown")
@@ -44,14 +44,16 @@ async def log_report_summary(
 ) -> None:
     """Send a summary entry after a report completes."""
 
-    status = "Success" if success else "❌ Failed"
-    mention = getattr(user, "mention", None) or f"[{user.first_name}](tg://user?id={user.id})"
+    status_label = "Success" if success else "Failed"
+    status_prefix = "✅" if success else "❌"
+    mention = getattr(user, "first_name", None) or "User"
+    duration = round(elapsed, 2)
     text = (
-        "📄 Report Log\n"
+        "📄 Report Summary\n"
         f"👤 {mention}\n"
         f"🔗 Target: {target}\n"
-        f"⏱ Duration: {int(elapsed)}s\n"
-        f"✅ Result: {status}"
+        f"⏱ Duration: {duration}s\n"
+        f"{status_prefix} Status: {status_label}"
     )
     await send_log(client, logs_group, text, parse_mode="markdown")
 

@@ -15,7 +15,7 @@ from pyrogram.types import CallbackQuery, Message
 import config
 from logging_utils import log_error, log_report_summary, log_user_start, send_log
 from report import send_report
-from session_bot import extract_sessions_from_text, prune_sessions, validate_sessions
+from session_bot import extract_sessions_from_text, prune_sessions, validate_session_string
 from state import QueueEntry, ReportQueue, StateManager
 from sudo import is_owner, is_sudo
 from ui import REPORT_REASONS, owner_panel, queued_message, reason_keyboard, report_type_keyboard, sudo_panel
@@ -43,7 +43,7 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
             return await func(*args, **kwargs)
         except Exception as exc:  # noqa: BLE001
             logging.exception("Handler error")
-            await log_error(app, await persistence.logs_group(), exc, config.OWNER_ID)
+            await log_error(app, await persistence.get_logs_group_id(), exc, config.OWNER_ID)
 
     async def _owner_guard(message: Message) -> bool:
         if not message.from_user or not is_owner(message.from_user.id):
@@ -61,10 +61,10 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
 
         user_id = message.from_user.id
         await persistence.add_known_chat(message.chat.id)
-        await log_user_start(app, await persistence.logs_group(), message)
+        await log_user_start(app, await persistence.get_logs_group_id(), message)
 
         if not is_sudo(user_id):
-            await message.reply_text("Access Denied: This bot is not for public use.")
+            await message.reply_text("🚫 You are not authorized to use this bot.")
             return
 
         live_sessions = await prune_sessions(persistence)
@@ -72,22 +72,18 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
         if is_owner(user_id):
             if not live_sessions:
                 await message.reply_text(
-                    "You need to set sessions first.\nPlease send valid Pyrogram session strings in the Session Manager Group.",
-                )
-                await message.reply_text(
-                    "Owner Control Panel",
-                    reply_markup=owner_panel(len(live_sessions)),
+                    "No sessions found. Please contact the bot owner.",
                 )
                 return
 
             await message.reply_text(
-                f"Owner Control Panel\nLive sessions: {len(live_sessions)}",
+                f"Live sessions: {len(live_sessions)}",
                 reply_markup=owner_panel(len(live_sessions)),
             )
         else:
             if not live_sessions:
                 await message.reply_text(
-                    "No sessions available.\nPlease contact the bot owner to add valid sessions.",
+                    "No sessions found. Please contact the bot owner.",
                 )
                 return
             await message.reply_text(
@@ -169,10 +165,10 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
             await query.answer("Unauthorized", show_alert=True)
             return
 
-        checking = await query.message.reply_text("Please wait... validating sessions")
+        checking = await query.message.reply_text("Validating sessions, please wait...")
         live_sessions = await prune_sessions(persistence, announce=True)
         if not live_sessions:
-            await checking.edit_text("No sessions available.\nPlease contact the bot owner to add valid sessions.")
+            await checking.edit_text("No sessions found. Please contact the bot owner.")
             return
 
         if queue.is_busy() and queue.active_user != query.from_user.id:
@@ -296,7 +292,7 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
             )
             await log_report_summary(
                 app,
-                await persistence.logs_group(),
+                await persistence.get_logs_group_id(),
                 user=message.from_user,
                 target=state.target_link or "",
                 elapsed=elapsed,
@@ -305,7 +301,7 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
         except Exception as exc:  # noqa: BLE001
             logging.exception("Report failed")
             await message.reply_text("Report failed due to an unexpected error.")
-            await log_error(app, await persistence.logs_group(), exc, config.OWNER_ID)
+            await log_error(app, await persistence.get_logs_group_id(), exc, config.OWNER_ID)
         finally:
             states.reset(message.from_user.id)
 
@@ -352,15 +348,14 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
 
     async def _handle_set_session(message: Message) -> None:
         if not message.from_user or not is_owner(message.from_user.id):
+            await message.reply_text("Only the owner can set the session manager group.")
             return
         if not await _ensure_admin(message.chat.id):
             await message.reply_text("Make me admin in this group first.")
             return
-        await persistence.set_session_group(message.chat.id)
+        await persistence.save_session_group_id(message.chat.id)
         await persistence.add_known_chat(message.chat.id)
-        await message.reply_text(
-            "✅ Session Manager Group set successfully.\nAll session strings sent here will now be processed."
-        )
+        await message.reply_text("✅ Session manager group set successfully.")
 
     @app.on_message(filters.command("set_log") & filters.group)
     async def set_log(_: Client, message: Message) -> None:
@@ -368,15 +363,14 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
 
     async def _handle_set_log(message: Message) -> None:
         if not message.from_user or not is_owner(message.from_user.id):
+            await message.reply_text("Only the owner can set the logs group.")
             return
         if not await _ensure_admin(message.chat.id):
             await message.reply_text("Make me admin in this group first.")
             return
-        await persistence.set_logs_group(message.chat.id)
+        await persistence.save_logs_group_id(message.chat.id)
         await persistence.add_known_chat(message.chat.id)
-        await message.reply_text(
-            "✅ Logs Group set successfully.\nAll future logs and broadcasts will be sent here."
-        )
+        await message.reply_text("✅ Logs group set successfully.")
 
     @app.on_message(filters.command("broadcast"))
     async def broadcast(_: Client, message: Message) -> None:
@@ -385,7 +379,7 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
     async def _handle_broadcast(message: Message) -> None:
         if not message.from_user or not is_owner(message.from_user.id):
             return
-        logs_group = await persistence.logs_group()
+        logs_group = await persistence.get_logs_group_id()
         if not logs_group or message.chat.id != logs_group:
             return
         payload = message.text.split(" ", 1)
@@ -408,10 +402,10 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
                 continue
         elapsed = round(monotonic() - start_time, 2)
         summary = (
-            "📢 Broadcast Completed\n"
-            f"👤 Users: {user_count}\n"
-            f"👥 Groups: {group_count}\n"
-            f"⏱ Duration: {elapsed}s"
+            "📢 Broadcast Sent\n"
+            f"👤 Sent to Users: {user_count}\n"
+            f"👥 Sent to Groups: {group_count}\n"
+            f"⏱ Time: {elapsed}s"
         )
         await send_log(app, logs_group, summary)
 
@@ -420,7 +414,7 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
         await _wrap_errors(_handle_session_ingestion, message)
 
     async def _handle_session_ingestion(message: Message) -> None:
-        session_group = await persistence.session_group()
+        session_group = await persistence.get_session_group_id()
         if not session_group or message.chat.id != session_group:
             return
         if not message.from_user or not is_owner(message.from_user.id):
@@ -432,24 +426,31 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
             await message.reply_text("❌ Invalid session string.")
             return
 
-        valid, invalid = await validate_sessions(sessions)
-        logs_group = await persistence.logs_group()
+        logs_group = await persistence.get_logs_group_id()
 
-        if valid:
-            added = await persistence.add_sessions(valid, added_by=message.from_user.id)
-            total_sessions = len(await persistence.get_sessions())
+        valid_count = 0
+        invalid_count = 0
+
+        for session in sessions:
+            if await validate_session_string(session):
+                await persistence.add_sessions([session], added_by=message.from_user.id)
+                valid_count += 1
+            else:
+                invalid_count += 1
+
+        total_sessions = len(await persistence.get_sessions())
+
+        if valid_count:
             await message.reply_text(
-                f"✅ Session saved.\nTotal valid sessions: {total_sessions}"
+                f"✅ Session saved.\n📦 Total valid sessions: {total_sessions}"
             )
             await send_log(
                 app,
                 logs_group,
-                f"{len(valid)} session(s) added from the session manager group.",
+                f"{valid_count} session(s) added from the session manager group.",
             )
-        if invalid:
-            await send_log(app, logs_group, f"Ignored {len(invalid)} invalid session strings.")
-            if not valid:
-                await message.reply_text("❌ Invalid session string.")
+        if invalid_count:
+            await message.reply_text("❌ Invalid session string.")
 
     @app.on_callback_query(filters.regex(r"^owner:(manage|set_session_group|set_logs_group)$"))
     async def owner_actions(_: Client, query: CallbackQuery) -> None:

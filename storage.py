@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import logging
 import os
+from pathlib import Path
 from typing import Iterable
 
 import config
@@ -30,11 +32,22 @@ class DataStore:
             "logs_group": config.LOGS_GROUP_ID,
         }
         self._in_memory_chats: set[int] = set()
+        self._snapshot_path: Path | None = None
 
         self.client = client
         self.db = db or (self.client.get_default_database() if self.client else None)
         if not self.db and self.client:
             self.db = self.client[db_name]
+
+    # ------------------- Internal helpers -------------------
+    def _persist_snapshot(self) -> None:
+        """Hook for subclasses to write the current in-memory state."""
+
+    def _update_from_snapshot(self, payload: dict) -> None:
+        self._in_memory_sessions = set(payload.get("sessions", []))
+        self._in_memory_reports = payload.get("reports", [])
+        self._in_memory_config.update(payload.get("config", {}))
+        self._in_memory_chats = set(payload.get("chats", []))
 
     # ------------------- Session storage -------------------
     async def add_sessions(self, sessions: Iterable[str], added_by: int | None = None) -> list[str]:
@@ -62,6 +75,8 @@ class DataStore:
                 if session not in self._in_memory_sessions:
                     self._in_memory_sessions.add(session)
                     added.append(session)
+
+        self._persist_snapshot()
 
         return added
 
@@ -91,6 +106,8 @@ class DataStore:
                     self._in_memory_sessions.discard(session)
                     removed += 1
 
+        self._persist_snapshot()
+
         return removed
 
     # ------------------- Report records -------------------
@@ -106,24 +123,40 @@ class DataStore:
         else:
             self._in_memory_reports.append(payload)
 
+        self._persist_snapshot()
+
     # ------------------- Config storage -------------------
     async def set_session_group(self, chat_id: int) -> None:
         await self._set_config_value("session_group", chat_id)
 
+    async def save_session_group_id(self, chat_id: int) -> None:
+        await self.set_session_group(chat_id)
+
     async def session_group(self) -> int | None:
         return await self._get_config_value("session_group")
+
+    async def get_session_group_id(self) -> int | None:
+        return await self.session_group()
 
     async def set_logs_group(self, chat_id: int) -> None:
         await self._set_config_value("logs_group", chat_id)
 
+    async def save_logs_group_id(self, chat_id: int) -> None:
+        await self.set_logs_group(chat_id)
+
     async def logs_group(self) -> int | None:
         return await self._get_config_value("logs_group")
+
+    async def get_logs_group_id(self) -> int | None:
+        return await self.logs_group()
 
     async def _set_config_value(self, key: str, value: int | None) -> None:
         if self.db:
             await self.db.config.update_one({"_id": "config"}, {"$set": {key: value}}, upsert=True)
         else:
             self._in_memory_config[key] = value
+
+        self._persist_snapshot()
 
     async def _get_config_value(self, key: str) -> int | None:
         if self.db:
@@ -137,6 +170,8 @@ class DataStore:
             await self.db.chats.update_one({"chat_id": chat_id}, {"$set": {"chat_id": chat_id}}, upsert=True)
         else:
             self._in_memory_chats.add(chat_id)
+
+        self._persist_snapshot()
 
     async def known_chats(self) -> list[int]:
         if self.db:
@@ -159,8 +194,10 @@ class DataStore:
 class FallbackDataStore(DataStore):
     """In-memory persistence used when MongoDB is unavailable."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, snapshot_path: str = "data_store.json") -> None:
         super().__init__(client=None, db=None)
+        self._snapshot_path = Path(snapshot_path)
+        self._load_snapshot()
 
     async def close(self) -> None:
         return None
@@ -169,12 +206,38 @@ class FallbackDataStore(DataStore):
     def is_persistent(self) -> bool:  # pragma: no cover - small override
         return False
 
+    # ------------------- File persistence helpers -------------------
+    def _load_snapshot(self) -> None:
+        if not self._snapshot_path or not self._snapshot_path.exists():
+            return
+        try:
+            payload = json.loads(self._snapshot_path.read_text())
+            if isinstance(payload, dict):
+                self._update_from_snapshot(payload)
+        except Exception:
+            logging.warning("Failed to load snapshot file; starting fresh.")
+
+    def _persist_snapshot(self) -> None:
+        if not self._snapshot_path:
+            return
+        payload = {
+            "sessions": list(self._in_memory_sessions),
+            "reports": self._in_memory_reports,
+            "config": self._in_memory_config,
+            "chats": list(self._in_memory_chats),
+        }
+        try:
+            self._snapshot_path.write_text(json.dumps(payload, default=str))
+        except Exception:
+            logging.warning("Failed to write snapshot to disk.")
+
 
 def build_datastore(
     mongo_uri: str | None,
     *,
     db_name: str = "reporter",
     mongo_env_var: str = "MONGO_URI",
+    snapshot_path: str = "data_store.json",
 ) -> DataStore:
     """Build a datastore safely, falling back when MongoDB is unavailable."""
 
@@ -184,7 +247,7 @@ def build_datastore(
             "MongoDB persistence disabled; set %s to a MongoDB connection URI to enable it.",
             mongo_env_var,
         )
-        return FallbackDataStore()
+        return FallbackDataStore(snapshot_path=snapshot_path)
 
     try:  # pragma: no cover - optional dependency
         import motor.motor_asyncio as motor_asyncio
@@ -193,7 +256,7 @@ def build_datastore(
             "MongoDB URI provided but Motor is unavailable; falling back to in-memory storage. Import error: %s",
             exc,
         )
-        return FallbackDataStore()
+        return FallbackDataStore(snapshot_path=snapshot_path)
 
     try:
         client = motor_asyncio.AsyncIOMotorClient(resolved_uri)
@@ -206,5 +269,5 @@ def build_datastore(
             mongo_env_var,
             exc,
         )
-        return FallbackDataStore()
+        return FallbackDataStore(snapshot_path=snapshot_path)
 

@@ -20,7 +20,7 @@ def owner_panel(live_count: int) -> InlineKeyboardMarkup:
 
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("🚀 Start Report", callback_data="sudo:start")],
+            [InlineKeyboardButton("Start Report", callback_data="sudo:start")],
             [InlineKeyboardButton("✅ Manage Sessions", callback_data="owner:manage")],
             [InlineKeyboardButton("➕ Set Session Group", callback_data="owner:set_session_group")],
             [InlineKeyboardButton("📝 Set Logs Group", callback_data="owner:set_logs_group")],
@@ -53,9 +53,10 @@ def reason_keyboard() -> InlineKeyboardMarkup:
 def queued_message(position: int) -> str:
     """User-facing queue notification."""
 
+    if position <= 1:
+        return ""
     return (
-        f"Another report is in progress. Your request is queued. Position: #{position}"
-        if position > 1
-        else ""
+        "Another report is in progress.\n"
+        f"You are #{position} in the queue. Please wait."
     )
 

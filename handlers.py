@@ -94,16 +94,19 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
 
     async def _resolve_target_across_sessions(
         target_link: str, sessions: list[str]
-    ) -> tuple[int | None, str | None]:
+    ) -> tuple[int | None, list[str], str | None]:
         """Resolve the target chat id using any available session string.
 
         This retries across every validated session so private/public links and
         message links can be resolved even when some sessions are missing
-        access. Returns the resolved chat id or ``None`` plus the last error
-        message for user feedback.
+        access. Returns the resolved chat id, a list of sessions that could
+        access the target, or ``None`` plus the last error message for user
+        feedback.
         """
 
         last_error: str | None = None
+        available_sessions: list[str] = []
+        resolved_chat_id: int | None = None
 
         for idx, session in enumerate(sessions):
             client = Client(
@@ -118,14 +121,18 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
                 await client.start()
                 try:
                     chat_id = await resolve_chat_id(client, target_link)
-                    return chat_id, None
+                    available_sessions.append(session)
+                    resolved_chat_id = chat_id
                 except Exception as exc:  # noqa: BLE001 - need detailed errors
                     last_error = str(exc)
             finally:
                 with contextlib.suppress(Exception):
                     await client.stop()
 
-        return None, last_error
+        if resolved_chat_id is None:
+            return None, [], last_error
+
+        return resolved_chat_id, available_sessions, None
 
     async def _prompt_report_count(message: Message) -> None:
         await message.reply_text(
@@ -813,7 +820,7 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
                 "requested": requested_count,
             }
 
-        resolved_chat_id, resolution_error = await _resolve_target_across_sessions(
+        resolved_chat_id, available_sessions, resolution_error = await _resolve_target_across_sessions(
             state.target_link, sessions
         )
         if resolved_chat_id is None:
@@ -830,6 +837,21 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
                 "requested": requested_count,
             }
 
+        if not available_sessions:
+            await message.reply_text(
+                "We couldn't find any sessions with access to this target. Please join the chat with your sessions first."
+            )
+            return {
+                "any_success": False,
+                "success_count": 0,
+                "failure_count": 0,
+                "attempted": 0,
+                "total_sessions": total_sessions,
+                "requested": requested_count,
+            }
+
+        sessions = available_sessions
+        total_sessions = len(sessions)
         chat_ref = resolved_chat_id
 
         await _log_stage(

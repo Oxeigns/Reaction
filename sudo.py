@@ -6,11 +6,12 @@ from functools import wraps
 from pathlib import Path
 from typing import Callable, Iterable
 
+import config
 from telegram import Update
 from telegram.ext import ApplicationHandlerStop, ContextTypes
 
 SUDO_STORE = Path(__file__).with_name("sudo_users.json")
-OWNERS: set[int] = {1888832817, 8191161834}
+OWNERS: set[int] = {config.OWNER_ID} if config.OWNER_ID else set()
 UNAUTHORIZED_MESSAGE = "You are unauthorised. Take sudo from owner to use this bot."
 
 
@@ -63,6 +64,8 @@ def is_sudo(user_id: int | None) -> bool:
     if user_id is None:
         return False
     if is_owner(user_id):
+        return True
+    if user_id in config.SUDO_USERS:
         return True
     return any(user.user_id == user_id for user in list_sudo_users())
 

@@ -13,16 +13,29 @@ from typing import Final
 #  🔴 FILL THESE VALUES CAREFULLY BEFORE DEPLOYMENT
 # -----------------------------------------------------------
 
-BOT_TOKEN: Final[str] = "8549633097:AAGeb2iAfIHCiSQJn5uKUqN8IHr7vztl6bU"
+BOT_TOKEN: Final[str] = os.getenv("BOT_TOKEN", "8549633097:AAGeb2iAfIHCiSQJn5uKUqN8IHr7vztl6bU")
 
-API_ID: Final[int] = 27989579        # ← Enter your API ID (integer)
-API_HASH: Final[str] = "64742ebe270a7d202150134d66397839"
+API_ID: Final[int | None] = int(os.getenv("API_ID", "27989579")) or None
+API_HASH: Final[str] = os.getenv("API_HASH", "64742ebe270a7d202150134d66397839")
 
-MONGO_URI: Final[str] = "mongodb+srv://annieregain:firstowner8v@anniere.ht2en.mongodb.net/?retryWrites=true&w=majority&appName=AnnieRE"
+MONGO_URI: Final[str] = os.getenv(
+    "MONGO_URI",
+    "mongodb+srv://annieregain:firstowner8v@anniere.ht2en.mongodb.net/?retryWrites=true&w=majority&appName=AnnieRE",
+)
 
 # Comma-separated Telegram user IDs that are allowed to issue admin commands
 # (e.g., /restart). Example: ADMIN_IDS="123,456".
-ADMIN_IDS: Final[set[int]] = {1888832817, 8191161834}
+ADMIN_IDS: Final[set[int]] = {
+    int(item)
+    for item in os.getenv("ADMIN_IDS", "1888832817,8191161834").split(",")
+    if item.strip().isdigit()
+}
+
+# Bot owner and optional sudo users (reporters) for role-based access.
+OWNER_ID: Final[int | None] = int(os.getenv("OWNER_ID", "1888832817")) or None
+SUDO_USERS: Final[set[int]] = {
+    int(item) for item in os.getenv("SUDO_USERS", "8191161834").split(",") if item.strip().isdigit()
+}
 
 # -----------------------------------------------------------
 #  (Optional) Author Verification — keep or remove as needed

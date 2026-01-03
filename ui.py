@@ -52,12 +52,12 @@ def report_count_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("1000 Reports", callback_data="report:count:1000"),
+                InlineKeyboardButton("500 Reports", callback_data="report:count:500"),
                 InlineKeyboardButton("2500 Reports", callback_data="report:count:2500"),
             ],
             [
-                InlineKeyboardButton("4000 Reports", callback_data="report:count:4000"),
-                InlineKeyboardButton("7000 Reports", callback_data="report:count:7000"),
+                InlineKeyboardButton("5000 Reports", callback_data="report:count:5000"),
+                InlineKeyboardButton("10000 Reports", callback_data="report:count:10000"),
             ],
         ]
     )

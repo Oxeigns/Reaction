@@ -28,7 +28,7 @@ class ReportTargetSpec:
         return self.normalized.lower()
 
 
-_TRIM_CHARS = ",.;)]}>'\"""
+_TRIM_CHARS = ",.;)]}>'\\\""
 _SUCCESS_TTL = timedelta(minutes=10)
 _FAILURE_TTL = timedelta(minutes=5)
 _CACHE: dict[str, tuple[dict[str, Any], datetime]] = {}
@@ -432,6 +432,8 @@ async def resolve_report_target(
         _cache_result(spec.cache_key(), result, failure=True)
         return result
 
+    fallback_result: dict[str, Any] | None = None
+    last_result: dict[str, Any] | None = None
     for client in clients:
         result = await _resolve_with_client(client, spec, allow_join=allow_join)
         if result["ok"]:
@@ -440,25 +442,32 @@ async def resolve_report_target(
             _cache_result(spec.cache_key(), result)
             return result
         if result.get("note") == "try_next_client":
+            last_result = result
             continue
         if result.get("error") == "FloodWait":
             await _sleep_for_flood(1)
+            last_result = result
             continue
-        _cache_result(spec.cache_key(), result, failure=True)
-        return result
+        if fallback_result is None:
+            fallback_result = result
+        last_result = result
 
-    result = {
-        "ok": False,
-        "kind": spec.kind,
-        "normalized": spec.normalized,
-        "chat_id": None,
-        "message_ids": spec.message_ids,
-        "resolved_by": None,
-        "did_join": False,
-        "note": "all_clients_failed",
-        "error": "unresolved",
-    }
-    _cache_result(spec.cache_key(), result, failure=True)
+    result = fallback_result or last_result
+    if result is None:
+        result = {
+            "ok": False,
+            "kind": spec.kind,
+            "normalized": spec.normalized,
+            "chat_id": None,
+            "message_ids": spec.message_ids,
+            "resolved_by": None,
+            "did_join": False,
+            "note": "all_clients_failed",
+            "error": "unresolved",
+        }
+
+    if result.get("error") not in {"PeerIdInvalid", "ChannelPrivate"}:
+        _cache_result(spec.cache_key(), result, failure=True)
     return result
 
 

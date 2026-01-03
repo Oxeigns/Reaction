@@ -40,7 +40,7 @@ from bot.constants import (
     TARGET_KIND,
 )
 from bot.dependencies import API_HASH, API_ID, data_store
-from bot.link_parser import parse_join_target
+from bot.link_parser import maybe_parse_message_link, parse_join_target
 from bot.target_resolver import (
     TargetDetails,
     ensure_join_if_needed,
@@ -807,7 +807,16 @@ async def _resolve_and_preview_target(update: Update, context: ContextTypes.DEFA
             getattr(resolution, "error", None),
             stack_info=True,
         )
-        await _set_status(footer=friendly_error("Could not resolve link/chat. Ensure I have access and the link is correct."))
+        error_text = "Could not resolve link/chat. Ensure I have access and the link is correct."
+        if spec.kind == "internal_message" and getattr(resolution, "error", None) in {
+            "PeerIdInvalid",
+            "ChannelPrivate",
+        }:
+            error_text = (
+                "This appears to be a private t.me/c link.\n"
+                "Your account must be a member of the chat or join via invite link."
+            )
+        await _set_status(footer=friendly_error(error_text))
         return False
 
     error_code = result.get("error")
@@ -1457,6 +1466,17 @@ async def handle_public_message_link(update: Update, context: ContextTypes.DEFAU
             "Send a valid public link or @username (https://t.me/username/1234)", reply_markup=navigation_keyboard()
         )
         return PUBLIC_MESSAGE
+
+    message_link = maybe_parse_message_link(text)
+    if message_link and getattr(message_link, "is_private", False):
+        flow_state(context)["target_kind"] = "private"
+        await update.effective_message.reply_text(
+            "This appears to be a private t.me/c link.\n"
+            "Your account must be a member of the chat or join via invite link.\n\n"
+            "Send the private invite link (https://t.me/+code)",
+            reply_markup=navigation_keyboard(show_back=False),
+        )
+        return PRIVATE_INVITE
 
     flow = flow_state(context)
     flow["targets"] = [text]

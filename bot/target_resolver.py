@@ -73,13 +73,10 @@ _CACHE_TTL = timedelta(minutes=10)
 _FAILURE_CACHE: dict[str, tuple[ResolvedTarget, datetime]] = {}
 _FAILURE_TTL = timedelta(minutes=5)
 _FATAL_ERRORS = {
-    "PeerIdInvalid",
-    "ChannelInvalid",
-    "ChannelPrivate",
-    "ChatIdInvalid",
     "UsernameInvalid",
     "UsernameNotOccupied",
-    "invalid_invite",
+    "ChannelInvalid",
+    "ChatIdInvalid",
 }
 
 
@@ -231,6 +228,7 @@ async def ensure_join_if_needed(client: Any, target_spec: TargetSpec) -> JoinRes
     )
 
     if not target_spec.invite_link and not target_spec.invite_hash:
+        _FAILURE_CACHE.pop(target_spec.cache_key(), None)
         return JoinResult(ok=True, joined=False, chat_id=expected_chat_id)
 
     invite_link = target_spec.invite_link or f"https://t.me/+{target_spec.invite_hash}"
@@ -251,6 +249,7 @@ async def ensure_join_if_needed(client: Any, target_spec: TargetSpec) -> JoinRes
             chat_id = _chat_id_from_chat(chat)
             title = getattr(chat, "title", None) or getattr(chat, "first_name", None)
             join_result = JoinResult(ok=True, joined=True, chat_id=chat_id, title=title)
+            _FAILURE_CACHE.pop(target_spec.cache_key(), None)
             if (
                 expected_chat_id is not None
                 and join_result.chat_id is not None
@@ -277,6 +276,7 @@ async def ensure_join_if_needed(client: Any, target_spec: TargetSpec) -> JoinRes
             chat = await client.get_chat(invite_link)
             chat_id = _chat_id_from_chat(chat)
             title = getattr(chat, "title", None) or getattr(chat, "first_name", None)
+            _FAILURE_CACHE.pop(target_spec.cache_key(), None)
             return JoinResult(
                 ok=True,
                 joined=False,
@@ -412,7 +412,8 @@ async def resolve_peer(client: Any, target_spec: TargetSpec, *, max_attempts: in
         except (UsernameNotOccupied, UsernameInvalid, PeerIdInvalid, ChannelInvalid, ChannelPrivate, ChatIdInvalid) as exc:
             last_error = exc.__class__.__name__
             resolved = ResolvedTarget(ok=False, peer=None, chat_id=None, method=method, error=last_error)
-            _cache_resolution(target_spec, resolved, failure=True)
+            if last_error in _FATAL_ERRORS:
+                _cache_resolution(target_spec, resolved, failure=True)
             return resolved
         except BadRequest as exc:
             last_error = exc.__class__.__name__

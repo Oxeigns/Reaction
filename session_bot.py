@@ -1,34 +1,69 @@
+# session_bot.py
+
 from __future__ import annotations
 
 """Pyrogram client builder and session utilities."""
 
 import contextlib
 import logging
+import re
+import uuid
 from typing import Iterable, Tuple
 
 from pyrogram import Client
+from pyrogram.errors import FloodWait, RPCError
 
 import config
 from bot.dependencies import ensure_pyrogram_creds, ensure_token
 from state import ReportQueue, StateManager
 from storage import build_datastore
 
+_SESSION_ALLOWED_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _looks_like_session_string(session: str) -> bool:
+    s = (session or "").strip()
+    if len(s) < 64:
+        return False
+    # Common Pyrogram string sessions are urlsafe base64-ish.
+    return bool(_SESSION_ALLOWED_RE.match(s))
+
 
 async def validate_session_string(session: str) -> bool:
-    """Ensure a Pyrogram session string can start and access basic info."""
+    """
+    Ensure a Pyrogram session string can start and access basic info.
+
+    Notes:
+      - We validate by actually connecting (start + get_me).
+      - Use in_memory=True + unique name to avoid SQLite/session file conflicts.
+      - FloodWait is treated as "temporarily blocked" (likely valid), not invalid.
+    """
+    s = (session or "").strip()
+    if not _looks_like_session_string(s):
+        return False
 
     client = Client(
-        name="validator",
+        name=f"validator_{uuid.uuid4().hex}",
         api_id=config.API_ID,
         api_hash=config.API_HASH,
-        session_string=session,
-        workdir="/tmp/validator",
+        session_string=s,
+        in_memory=True,
+        no_updates=True,
     )
+
     try:
         await client.start()
         await client.get_me()
         return True
-    except Exception:
+    except FloodWait as e:
+        # Why: FloodWait can happen even for valid sessions; marking invalid would delete good sessions.
+        logging.warning("Session validation hit FloodWait(%ss); treating as valid for now.", getattr(e, "value", "?"))
+        return True
+    except RPCError as e:
+        logging.warning("Session validation RPCError: %s", e.__class__.__name__)
+        return False
+    except Exception as e:  # noqa: BLE001
+        logging.warning("Session validation failed: %s", e.__class__.__name__)
         return False
     finally:
         with contextlib.suppress(Exception):
@@ -48,7 +83,6 @@ async def validate_sessions(sessions: Iterable[str]) -> Tuple[list[str], list[st
 
 async def prune_sessions(persistence, *, announce: bool = False) -> list[str]:
     """Remove invalid sessions and return the surviving ones."""
-
     sessions = await persistence.get_sessions()
     if not sessions:
         return []
@@ -62,14 +96,12 @@ async def prune_sessions(persistence, *, announce: bool = False) -> list[str]:
 
 def extract_sessions_from_text(text: str) -> list[str]:
     """Parse potential session strings from raw text."""
-
-    candidates = [part.strip() for part in text.split() if len(part.strip()) > 50]
+    candidates = [part.strip() for part in (text or "").split() if len(part.strip()) > 50]
     return [candidate for candidate in candidates if is_session_string(candidate)]
 
 
 def is_session_string(text: str) -> bool:
     """Heuristically determine if text looks like a Pyrogram session string."""
-
     return bool(text and (":" in text or len(text) > 80))
 
 
@@ -89,4 +121,3 @@ def create_bot() -> tuple[Client, object, StateManager, ReportQueue]:
     )
 
     return app, persistence, states, queue
-

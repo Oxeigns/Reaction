@@ -10,6 +10,7 @@ import signal
 from pyrogram import idle
 from pyrogram.errors import ApiIdInvalid, BadRequest
 
+import config
 from handlers import register_handlers
 from session_bot import create_bot
 
@@ -18,6 +19,10 @@ logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(name)s: %(mess
 
 async def start_bot() -> None:
     app, persistence, states, queue = create_bot()
+
+    sudo_users = await persistence.get_sudo_users()
+    config.SUDO_USERS = set(sudo_users)  # type: ignore[attr-defined]
+    
     register_handlers(app, persistence, states, queue)
 
     try:

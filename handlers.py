@@ -84,30 +84,19 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
         await persistence.add_known_chat(message.chat.id)
         await log_user_start(app, await persistence.get_logs_group_id(), message)
 
-        if not await _is_sudo_user(user_id):
-            await message.reply_text("You are not authorized to use this bot.")
-            await _log_stage("Unauthorized", f"User {user_id} attempted /start")
-            return
-
-        live_sessions = await prune_sessions(persistence)
-
-        if not live_sessions:
-            await message.reply_text("No sessions found. Contact owner")
-            await _log_stage("Start", f"User {user_id} saw empty session list")
-            return
-
         if is_owner(user_id):
-            await message.reply_text(
-                f"Live sessions: {len(live_sessions)}",
-                reply_markup=owner_panel(len(live_sessions)),
-            )
-            await _log_stage("Owner Start", f"Owner opened panel with {len(live_sessions)} sessions")
-        else:
-            await message.reply_text(
-                f"Live sessions: {len(live_sessions)}",
-                reply_markup=sudo_panel(len(live_sessions)),
-            )
-            await _log_stage("Sudo Start", f"Sudo {user_id} ready to report with {len(live_sessions)} sessions")
+            await message.reply_text("Welcome, Owner!", reply_markup=owner_panel())
+            await _log_stage("Owner Start", "Owner opened start panel")
+            return
+
+        if await _is_sudo_user(user_id):
+            await message.reply_text("Start Report", reply_markup=sudo_panel(0))
+            await _log_stage("Sudo Start", f"Sudo {user_id} opened start panel")
+            return
+
+        print(f"[DEBUG] Unauthorized start from user {user_id}")
+        await message.reply_text("You are not authorized.")
+        await _log_stage("Unauthorized", f"User {user_id} attempted /start")
 
     @app.on_message(filters.command("addsudo"))
     async def add_sudo(_: Client, message: Message) -> None:
@@ -257,6 +246,7 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
         if not message.from_user:
             return
         if not await _is_sudo_user(message.from_user.id):
+            print(f"[DEBUG] Unauthorized text from {message.from_user.id}")
             await message.reply_text("You are not authorized to use this bot.")
             await _log_stage("Unauthorized", f"User {message.from_user.id} attempted text routing")
             return
@@ -292,6 +282,7 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
         state.started_at = monotonic()
 
         if queue.is_busy() and queue.active_user != message.from_user.id:
+            await message.reply_text("⏳ Please wait while another report is in progress.")
             notice = queued_message(queue.expected_position(message.from_user.id))
             if notice:
                 await message.reply_text(notice)
@@ -391,14 +382,12 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
 
     async def _handle_set_session(message: Message) -> None:
         if not message.from_user or not is_owner(message.from_user.id):
+            print("[DEBUG] Unauthorized set_session attempt")
             await message.reply_text("Only the owner can set the session manager group.")
-            return
-        if not await _ensure_admin(message.chat.id):
-            await message.reply_text("Make me admin in this group first.")
             return
         await persistence.save_session_group_id(message.chat.id)
         await persistence.add_known_chat(message.chat.id)
-        await message.reply_text("✅ Session manager group set successfully.")
+        await message.reply_text("✅ Session group set.")
         await _log_stage("Session Group Set", f"Session group updated to {message.chat.id}")
 
     @app.on_message(filters.command("set_log") & filters.group)
@@ -407,14 +396,12 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
 
     async def _handle_set_log(message: Message) -> None:
         if not message.from_user or not is_owner(message.from_user.id):
+            print("[DEBUG] Unauthorized set_log attempt")
             await message.reply_text("Only the owner can set the logs group.")
-            return
-        if not await _ensure_admin(message.chat.id):
-            await message.reply_text("Make me admin in this group first.")
             return
         await persistence.save_logs_group_id(message.chat.id)
         await persistence.add_known_chat(message.chat.id)
-        await message.reply_text("✅ Logs group set successfully.")
+        await message.reply_text("✅ Logs group set.")
         await _log_stage("Logs Group Set", f"Logs group updated to {message.chat.id}")
 
     @app.on_message(filters.command("broadcast"))
@@ -423,9 +410,11 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
 
     async def _handle_broadcast(message: Message) -> None:
         if not message.from_user or not is_owner(message.from_user.id):
+            print("[DEBUG] Unauthorized broadcast attempt")
             return
         logs_group = await persistence.get_logs_group_id()
         if not logs_group or message.chat.id != logs_group:
+            print("[DEBUG] Broadcast called outside logs group")
             return
         payload = message.text.split(" ", 1)
         if len(payload) < 2:
@@ -443,16 +432,18 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
                     user_count += 1
                 else:
                     group_count += 1
-            except Exception:
+            except Exception as exc:  # noqa: BLE001
+                print(f"[DEBUG] Broadcast failed for {chat_id}: {exc}")
                 continue
         elapsed = round(monotonic() - start_time, 2)
         summary = (
-            "📢 Broadcast Sent\n"
-            f"👤 Sent to Users: {user_count}\n"
-            f"👥 Sent to Groups: {group_count}\n"
+            "📢 Broadcast sent to:\n"
+            f"👤 Users: {user_count}\n"
+            f"👥 Groups: {group_count}\n"
             f"⏱ Time: {elapsed}s"
         )
         await send_log(app, logs_group, summary)
+        await message.reply_text(summary)
 
     @app.on_message(filters.group & (filters.text | filters.caption))
     async def session_ingestion(_: Client, message: Message) -> None:
@@ -460,40 +451,36 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
 
     async def _handle_session_ingestion(message: Message) -> None:
         session_group = await persistence.get_session_group_id()
+        if not session_group:
+            print("[DEBUG] Session group id not configured")
+            return
         if message.chat.id != session_group:
+            print(f"[DEBUG] Session message in non-session group {message.chat.id}")
             return
         if not message.from_user:
             return
-
-        await message.reply_text("📥 Bot received your message.")
-        await _log_stage(
-            "Session Intake",
-            f"Message captured in session group {message.chat.id} from {message.from_user.id}",
-        )
+        if not is_owner(message.from_user.id):
+            print(f"[DEBUG] Non-owner {message.from_user.id} attempted session save")
+            return
 
         text_content = message.text or message.caption or ""
         sessions = extract_sessions_from_text(text_content)
         if not sessions:
-            await message.reply_text("❌ Invalid session string.")
+            print("[DEBUG] No sessions found in message text")
+            await message.reply("❌ Invalid")
             await _log_stage("Session Intake", "No valid sessions found in message")
             return
 
-        valid_count, invalid_count = 0, 0
-
         for session in sessions:
             if await validate_session_string(session):
-                await persistence.add_sessions([session], added_by=message.from_user.id)
-                valid_count += 1
+                try:
+                    await persistence.add_sessions([session], added_by=message.from_user.id)
+                    await message.reply("✅ Saved")
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[DEBUG] Session save failed: {exc}")
+                    await message.reply("❌ Failed to save session")
             else:
-                invalid_count += 1
-
-        if valid_count:
-            total = len(await persistence.get_sessions())
-            await message.reply_text(f"✅ Session saved.\n📦 Total valid sessions: {total}")
-            await _log_stage("Session Stored", f"{valid_count} new sessions saved; total {total}")
-        if invalid_count:
-            await message.reply_text("❌ Some session(s) were invalid.")
-            await _log_stage("Session Reject", f"{invalid_count} invalid sessions rejected")
+                await message.reply("❌ Invalid")
 
     @app.on_callback_query(filters.regex(r"^owner:(manage|set_session_group|set_logs_group)$"))
     async def owner_actions(_: Client, query: CallbackQuery) -> None:

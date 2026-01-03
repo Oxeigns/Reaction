@@ -15,7 +15,7 @@ REPORT_REASONS = {
 }
 
 
-def owner_panel(live_count: int) -> InlineKeyboardMarkup:
+def owner_panel(_: int | None = None) -> InlineKeyboardMarkup:
     """Owner dashboard with management shortcuts."""
 
     return InlineKeyboardMarkup(

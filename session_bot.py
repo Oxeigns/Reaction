@@ -1,402 +1,454 @@
 from __future__ import annotations
 
+"""Pyrogram entrypoint implementing the owner/sudo workflows."""
+
+import contextlib
+import logging
+import traceback
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Tuple
-from urllib.parse import urlparse
+from time import monotonic
+from typing import Optional
 
 from pyrogram import Client, filters
-from pyrogram.errors import (
-    AuthKeyUnregistered,
-    BadRequest,
-    ChannelPrivate,
-    ChatAdminRequired,
-    ChatWriteForbidden,
-    FloodWait,
-    MessageIdInvalid,
-    RPCError,
-    SessionDeactivated,
-    UserBannedInChannel,
-    UserDeactivated,
-    UserDeactivatedBan,
-    UsernameNotOccupied,
-)
 from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 import config
+from bot.config_store import build_config_store
+from bot.report_queue import ReportQueue
+from bot.utils import session_strings_from_text, validate_sessions
 from report import send_report
 
 
-app = Client("my_session", api_id=config.API_ID, api_hash=config.API_HASH)
+logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(name)s: %(message)s")
+
+app = Client("reaction-bot", bot_token=config.BOT_TOKEN, api_id=config.API_ID, api_hash=config.API_HASH)
+config_store, datastore = build_config_store(config.MONGO_URI)
+queue = ReportQueue()
 
 
-TARGET_MENU = InlineKeyboardMarkup(
-    [
-        [InlineKeyboardButton("Public", callback_data="public")],
-        [InlineKeyboardButton("Private", callback_data="private")],
-    ]
-)
+def safe_handler(func):
+    async def wrapper(*args, **kwargs):
+        try:
+            return await func(*args, **kwargs)
+        except Exception as exc:  # noqa: BLE001
+            logging.exception("Handler error")
+            await _send_log(f"⚠️ Error detected:\n{exc}\n{traceback.format_exc()}")
+
+    return wrapper
 
 
 @dataclass
-class UserState:
-    stage: str = "session_verification"
-    target_type: Optional[str] = None
+class ReportState:
+    stage: str = "idle"
+    report_type: Optional[str] = None
     invite_link: Optional[str] = None
-    last_target: Optional[str] = None
-    join_status: str = "join not attempted"
-    errors: list[Tuple[str, str]] = field(default_factory=list)
-
-    def reset_target(self) -> None:
-        self.target_type = None
-        self.invite_link = None
-        self.last_target = None
-        self.join_status = "join not attempted"
-        self.errors.clear()
+    target_link: Optional[str] = None
+    reason: Optional[str] = None
+    started_at: float = field(default_factory=monotonic)
 
 
-user_states: Dict[int, UserState] = {}
+user_states: dict[int, ReportState] = {}
 
 
-def _clean_url(text: str) -> str:
-    cleaned = (text or "").strip()
-    if cleaned and not cleaned.startswith("http"):
-        return f"https://{cleaned}"
-    return cleaned
+def is_owner(user_id: int | None) -> bool:
+    return bool(user_id and config.OWNER_ID and user_id == config.OWNER_ID)
 
 
-def parse_invite_link(url: str) -> str:
-    cleaned = _clean_url(url)
-    parsed = urlparse(cleaned)
-    path = parsed.path.rstrip("/")
-    if not parsed.netloc.endswith("t.me"):
-        raise ValueError("Invalid link format: expected t.me domain")
-
-    if path.startswith("/+"):
-        return f"https://t.me{path}"
-
-    if path.startswith("/joinchat/"):
-        return f"https://t.me{path}"
-
-    raise ValueError("Invalid link format: not an invite link")
+def is_sudo(user_id: int | None) -> bool:
+    if is_owner(user_id):
+        return True
+    return bool(user_id and user_id in config.SUDO_USERS)
 
 
-def parse_public_message_link(url: str) -> tuple[str | int, int]:
-    cleaned = _clean_url(url)
-    parsed = urlparse(cleaned)
-    parts = [p for p in parsed.path.split("/") if p]
-    if not parsed.netloc.endswith("t.me") or len(parts) < 2:
-        raise ValueError("Invalid link format: expected public message link")
-
-    if parts[0] == "c" and len(parts) >= 3:
-        chat_id = int(f"-100{parts[1]}")
-        return chat_id, int(parts[2])
-
-    chat_username = parts[0]
-    message_id = int(parts[1])
-    return chat_username, message_id
-
-
-def parse_private_message_link(url: str) -> tuple[int, int]:
-    cleaned = _clean_url(url)
-    parsed = urlparse(cleaned)
-    parts = [p for p in parsed.path.split("/") if p]
-    if not parsed.netloc.endswith("t.me") or len(parts) < 3 or parts[0] != "c":
-        raise ValueError("Invalid link format: expected private message link")
-
-    chat_id = int(f"-100{parts[1]}")
-    return chat_id, int(parts[2])
-
-
-def categorize_exception(exc: Exception) -> tuple[str, str]:
-    if isinstance(exc, FloodWait):
-        return "FloodWait", f"Flood wait {getattr(exc, 'value', '')}"
-
-    if isinstance(exc, (UserDeactivated, UserDeactivatedBan, SessionDeactivated, AuthKeyUnregistered)):
-        return "Client banned / deactivated", str(exc)
-
-    if isinstance(exc, MessageIdInvalid):
-        return "Message not found / deleted", str(exc)
-
-    if isinstance(exc, ValueError):
-        return "Invalid link format", str(exc)
-
-    if isinstance(exc, (ChannelPrivate, ChatAdminRequired, ChatWriteForbidden, UserBannedInChannel)):
-        return "Valid link but access denied", str(exc)
-
-    if isinstance(exc, UsernameNotOccupied):
-        return "Valid link but access denied", "Chat not found"
-
-    if isinstance(exc, (BadRequest, RPCError)):
-        return "Valid link but access denied", str(exc)
-
-    return "Valid link but access denied", str(exc)
-
-
-def _map_chat_type(chat_type: str | None) -> str:
-    if not chat_type:
-        return "Unknown"
-    if chat_type.lower() in {"channel"}:
-        return "Channel"
-    if chat_type.lower() in {"group", "supergroup"}:
-        return "Group"
-    return chat_type.title()
-
-
-async def send_target_menu(message: Message) -> None:
-    await message.reply_text(
-        "Select target type (public or private).",
-        reply_markup=TARGET_MENU,
+def _control_panel() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Manage Sessions", callback_data="owner:manage")],
+            [InlineKeyboardButton("Set Session Group", callback_data="owner:set_session_group")],
+            [InlineKeyboardButton("Set Logs Group", callback_data="owner:set_logs_group")],
+        ]
     )
 
 
-async def send_session_prompt(message: Message) -> None:
-    me = await app.get_me()
-    await message.reply_text(
-        "Session verification required."
-        f"\nUser session: @{me.username or me.first_name} (ID: {me.id})."
-        "\nConfirm this is the authorized account. Reply with 'verify' to proceed or 'login' if you need to relogin.",
-        reply_markup=TARGET_MENU,
-    )
+def _sudo_panel(live_count: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("Start Report", callback_data="sudo:start_report")]])
 
 
-async def report_validation_result(message: Message, *, target_type: str, chat_type: str, chat_identifier: str,
-                                   message_id: int, join_status: str, errors: list[Tuple[str, str]], validated: bool) -> None:
-    success_join = 1 if "joined successfully" in join_status or "already" in join_status else 0
-    failed_join = 0 if success_join else 1
-    error_lines = [f"• {category}: {detail}" for category, detail in errors] or ["• None"]
+async def _send_log(text: str, *, parse_mode: str | None = None) -> None:
+    chat_id = await config_store.logs_group()
+    if not chat_id:
+        return
+    try:
+        await app.send_message(chat_id, text, parse_mode=parse_mode)
+    except Exception:
+        logging.exception("Failed to send log message")
 
-    summary = (
-        "Target validation\n"
-        f"- Target type: {target_type.title()}\n"
-        f"- Chat type: {chat_type}\n"
-        f"- Chat identifier: {chat_identifier}\n"
-        f"- Message ID: {message_id}\n"
-        f"- Join status: {join_status}\n"
-        f"- Sessions joined: {success_join}\n"
-        f"- Sessions failed: {failed_join}\n"
-        f"- Errors:\n" + "\n".join(error_lines)
-    )
 
-    await message.reply_text(summary)
+async def _prune_sessions() -> list[str]:
+    sessions = await datastore.get_sessions()
+    if not sessions or not (config.API_ID and config.API_HASH):
+        return []
 
-    if validated:
-        try:
-            await send_report(app, chat_identifier, message_id, reason=5, reason_text="Automated moderation report")
-            await message.reply_text(
-                "Reporting system engaged. Moderation/abuse report submitted using configured logic.")
-        except Exception as exc:  # pragma: no cover - defensive
-            category, detail = categorize_exception(exc)
-            await message.reply_text(f"Reporting failed. {category}: {detail}")
+    valid, invalid = await validate_sessions(config.API_ID, config.API_HASH, sessions)
+    if invalid:
+        await datastore.remove_sessions(invalid)
+    return valid
+
+
+async def _ensure_admin(chat_id: int) -> bool:
+    try:
+        member = await app.get_chat_member(chat_id, (await app.get_me()).id)
+        return bool(member and getattr(member, "status", "") in {"administrator", "creator"})
+    except Exception:
+        return False
 
 
 @app.on_message(filters.command("start"))
+@safe_handler
 async def start_handler(_: Client, message: Message) -> None:
-    state = user_states.setdefault(message.from_user.id, UserState())
-    state.stage = "session_verification"
-    state.reset_target()
-    await send_session_prompt(message)
-
-
-@app.on_callback_query(filters.regex("^(private|public)$"))
-async def menu_callback_handler(_: Client, callback_query: CallbackQuery) -> None:
-    user = callback_query.from_user
-    state = user_states.setdefault(user.id, UserState())
-
-    if state.stage == "session_verification":
-        await callback_query.answer("Verify the session first.", show_alert=True)
+    user_id = message.from_user.id if message.from_user else None
+    if not is_sudo(user_id):
+        await message.reply_text("You are unauthorised. Take sudo from owner to use this bot.")
         return
 
-    choice = callback_query.data
-    state.target_type = choice
+    valid_sessions = await _prune_sessions()
+    await config_store.add_known_chat(message.chat.id)
+
+    if is_owner(user_id):
+        await message.reply_text("Owner control panel", reply_markup=_control_panel())
+        return
+
+    await _log_new_user(message)
+    await message.reply_text(
+        f"Live sessions: {len(valid_sessions)}", reply_markup=_sudo_panel(len(valid_sessions))
+    )
+
+
+async def _log_new_user(message: Message) -> None:
+    if not message.from_user:
+        return
+    if is_owner(message.from_user.id):
+        return
+    await _send_log(
+        "🔔 New user started bot:\n"
+        f"👤 User: [{message.from_user.first_name}](tg://user?id={message.from_user.id})\n"
+        f"🆔 ID: {message.from_user.id}",
+        parse_mode="markdown",
+    )
+
+
+def _type_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Public", callback_data="report:type:public")],
+            [InlineKeyboardButton("Private", callback_data="report:type:private")],
+        ]
+    )
+
+
+async def _prompt_report_type(message: Message) -> None:
+    await message.reply_text("Select report type", reply_markup=_type_keyboard())
+
+
+@app.on_callback_query(filters.regex("^sudo:start_report$"))
+@safe_handler
+async def sudo_start_report(_: Client, query: CallbackQuery) -> None:
+    user_id = query.from_user.id if query.from_user else 0
+    message = query.message
+    if not message:
+        return
+
+    if queue.is_running(user_id):
+        await query.answer("Another report is in progress. Your request is queued. Please wait...", show_alert=True)
+
+    async def _job():
+        await _handle_start_report(query, message)
+
+    await queue.enqueue(user_id, _job)
+
+
+@safe_handler
+async def _handle_start_report(query: CallbackQuery, message: Message) -> None:
+    await query.answer()
+    checking = await message.reply_text("Please wait, checking live sessions...")
+    valid_sessions = await _prune_sessions()
+    await checking.edit_text(f"Live sessions available: {len(valid_sessions)}")
+    if not valid_sessions:
+        await message.reply_text("No valid sessions available. Contact the owner to add more.")
+        return
+
+    state = user_states.setdefault(query.from_user.id, ReportState())
+    state.stage = "type"
+    state.report_type = None
     state.invite_link = None
-    state.last_target = None
-    state.errors.clear()
-    if choice == "private":
-        state.stage = "waiting_invite"
-        await callback_query.message.reply_text(
-            "STEP 2 — Target Type: Private selected. Send the private invite link (https://t.me/+HASH or https://t.me/joinchat/HASH)."
-        )
-    else:
-        state.stage = "waiting_public_link"
-        await callback_query.message.reply_text(
-            "STEP 2 — Target Type: Public selected. Send the public Telegram message link (https://t.me/username/123 or https://t.me/c/123456789/456)."
-        )
-
-    await callback_query.answer()
+    state.target_link = None
+    state.reason = None
+    await _prompt_report_type(message)
 
 
-async def handle_session_verification(message: Message, state: UserState) -> None:
-    normalized = (message.text or "").strip().lower()
-    if normalized == "verify":
-        state.stage = "target_selection"
-        await message.reply_text("Session verified. Proceed to target selection.")
-        await send_target_menu(message)
+@app.on_callback_query(filters.regex("^report:type:(public|private)$"))
+@safe_handler
+async def choose_type(_: Client, query: CallbackQuery) -> None:
+    if not is_sudo(query.from_user.id if query.from_user else None):
+        await query.answer("Unauthorised", show_alert=True)
         return
 
-    if normalized == "login":
-        await message.reply_text(
-            "Update the session string and restart the client to relogin. Reply 'verify' after relogin.")
+    state = user_states.setdefault(query.from_user.id, ReportState())
+    state.report_type = query.data.split(":")[-1]
+    state.stage = "invite" if state.report_type == "private" else "link"
+    await query.answer()
+    prompt = (
+        "Send private invite link first (https://t.me/+code)." if state.report_type == "private" else "Send the public message link."
+    )
+    await query.message.reply_text(prompt)
+
+
+@app.on_message(filters.text & ~filters.command(["start", "broadcast", "set_session", "set_log"]))
+@safe_handler
+async def text_handler(_: Client, message: Message) -> None:
+    user_id = message.from_user.id if message.from_user else None
+    if not is_sudo(user_id):
         return
 
-    await message.reply_text("Awaiting verification. Reply with 'verify' to continue or 'login' to relogin.")
+    state = user_states.setdefault(user_id, ReportState())
+    if state.stage == "invite":
+        state.invite_link = message.text.strip()
+        state.stage = "link"
+        await message.reply_text("Invite saved. Now send the target message link.")
+        return
+
+    if state.stage == "link":
+        state.target_link = message.text.strip()
+        state.stage = "reason"
+        await message.reply_text("Provide a short report reason.")
+        return
+
+    if state.stage == "reason":
+        state.reason = message.text.strip()
+        await _begin_report(message, state)
+        return
+
+    await message.reply_text("Use Start Report to begin a new report.")
 
 
-async def attempt_join(chat_ref, *, via_invite: Optional[str]) -> tuple[str, list[Tuple[str, str]]]:
-    errors: list[Tuple[str, str]] = []
+async def _begin_report(message: Message, state: ReportState) -> None:
+    sessions = await _prune_sessions()
+    if not sessions:
+        await message.reply_text("No valid sessions available.")
+        return
+
+    state.stage = "running"
+    state.started_at = monotonic()
+    await message.reply_text("Report started. Executing sequentially…")
+    await queue.enqueue(message.from_user.id, lambda: _run_report_job(message, state, sessions))
+
+
+@safe_handler
+async def _run_report_job(message: Message, state: ReportState, sessions: list[str]) -> None:
     try:
-        if via_invite:
-            await app.join_chat(via_invite)
+        success = await _perform_report(state, sessions)
+        elapsed = monotonic() - state.started_at
+        status = "Success" if success else "Failed"
+        await message.reply_text(f"Report completed. Status: {status}")
+        await _send_log(
+            "📄 Report Summary\n"
+            f"👤 User: [{message.from_user.first_name}](tg://user?id={message.from_user.id})\n"
+            f"🔗 Link: {state.target_link}\n"
+            f"⏱️ Time Taken: {int(elapsed)}s\n"
+            f"✅ Status: {status if success else '❌ Failed'}",
+            parse_mode="markdown",
+        )
+    except Exception as exc:  # noqa: BLE001
+        logging.exception("Report failed")
+        await message.reply_text("Report failed due to an unexpected error.")
+        await _send_log(f"⚠️ Error detected:\n{exc}\n{traceback.format_exc()}")
+    finally:
+        user_states[message.from_user.id] = ReportState()
+
+
+async def _perform_report(state: ReportState, sessions: list[str]) -> bool:
+    if not state.target_link:
+        return False
+
+    chat_ref: str | int
+    message_id: int
+    try:
+        if state.report_type == "private":
+            chat_ref, message_id = _parse_private_link(state.target_link)
         else:
-            await app.join_chat(chat_ref)
-        return "joined successfully", errors
-    except Exception as exc:  # pragma: no cover - network dependent
-        category, detail = categorize_exception(exc)
-        errors.append((category, detail))
-        return f"failed ({detail})", errors
+            chat_ref, message_id = _parse_public_link(state.target_link)
+    except Exception:
+        return False
 
+    if state.report_type == "private" and state.invite_link:
+        # best-effort join with first session
+        await _join_with_session(sessions[0], state.invite_link)
 
-async def validate_public_target(message: Message, state: UserState) -> None:
-    try:
-        chat_ref, message_id = parse_public_message_link(message.text)
-    except Exception as exc:
-        category, detail = categorize_exception(exc)
-        await report_validation_result(
-            message,
-            target_type="Public",
-            chat_type="Unknown",
-            chat_identifier=message.text or "",
-            message_id=0,
-            join_status="failed",
-            errors=[(category, detail)],
-            validated=False,
+    for idx, session in enumerate(sessions):
+        client = Client(
+            name=f"report_{idx}",
+            api_id=config.API_ID,
+            api_hash=config.API_HASH,
+            session_string=session,
+            workdir=f"/tmp/report_{idx}",
         )
-        return
-
-    errors: list[Tuple[str, str]] = []
-    join_status, join_errors = await attempt_join(chat_ref, via_invite=None)
-    errors.extend(join_errors)
-
-    chat_identifier = chat_ref if isinstance(chat_ref, str) else f"/c/{str(chat_ref)[4:]}"
-    chat_type = "Unknown"
-    try:
-        chat = await app.get_chat(chat_ref)
-        chat_type = _map_chat_type(getattr(chat, "type", None))
-    except Exception as exc:  # pragma: no cover - network dependent
-        category, detail = categorize_exception(exc)
-        errors.append((category, detail))
-
-    validated = False
-    try:
-        await app.get_messages(chat_ref, message_id)
-        validated = len(errors) == 0
-    except Exception as exc:  # pragma: no cover - network dependent
-        category, detail = categorize_exception(exc)
-        errors.append((category, detail))
-
-    await report_validation_result(
-        message,
-        target_type="Public",
-        chat_type=chat_type,
-        chat_identifier=chat_identifier,
-        message_id=message_id,
-        join_status=join_status,
-        errors=errors,
-        validated=validated,
-    )
-    state.reset_target()
-    state.stage = "target_selection"
-    await send_target_menu(message)
-
-
-async def validate_private_target(message: Message, state: UserState) -> None:
-    if state.stage == "waiting_invite":
         try:
-            invite_link = parse_invite_link(message.text)
-        except Exception as exc:
-            category, detail = categorize_exception(exc)
-            await message.reply_text(f"Invite link error — {category}: {detail}")
-            return
+            await client.start()
+            await send_report(client, chat_ref, message_id, 0, state.reason or "Report")
+        except Exception:
+            continue
+        finally:
+            with contextlib.suppress(Exception):
+                await client.stop()
+    return True
 
-        state.invite_link = invite_link
-        state.stage = "waiting_private_link"
-        await message.reply_text(
-            "Invite link recorded. Send the private message link (https://t.me/c/123456789/456)."
-        )
-        return
 
-    if state.stage != "waiting_private_link":
-        await message.reply_text("Select target type first.")
-        return
-
-    try:
-        chat_id, message_id = parse_private_message_link(message.text)
-    except Exception as exc:
-        category, detail = categorize_exception(exc)
-        await report_validation_result(
-            message,
-            target_type="Private",
-            chat_type="Unknown",
-            chat_identifier=message.text or "",
-            message_id=0,
-            join_status="failed",
-            errors=[(category, detail)],
-            validated=False,
-        )
-        return
-
-    errors: list[Tuple[str, str]] = []
-    join_status, join_errors = await attempt_join(chat_id, via_invite=state.invite_link)
-    errors.extend(join_errors)
-
-    chat_identifier = f"/c/{str(chat_id)[4:]}"
-    chat_type = "Unknown"
-    try:
-        chat = await app.get_chat(chat_id)
-        chat_type = _map_chat_type(getattr(chat, "type", None))
-    except Exception as exc:  # pragma: no cover - network dependent
-        category, detail = categorize_exception(exc)
-        errors.append((category, detail))
-
-    validated = False
-    try:
-        await app.get_messages(chat_id, message_id)
-        validated = len(errors) == 0
-    except Exception as exc:  # pragma: no cover - network dependent
-        category, detail = categorize_exception(exc)
-        errors.append((category, detail))
-
-    await report_validation_result(
-        message,
-        target_type="Private",
-        chat_type=chat_type,
-        chat_identifier=chat_identifier,
-        message_id=message_id,
-        join_status=join_status,
-        errors=errors,
-        validated=validated,
+async def _join_with_session(session: str, invite_link: str) -> None:
+    client = Client(
+        name="joiner",
+        api_id=config.API_ID,
+        api_hash=config.API_HASH,
+        session_string=session,
+        workdir="/tmp/joiner",
     )
-    state.reset_target()
-    state.stage = "target_selection"
-    await send_target_menu(message)
+    try:
+        await client.start()
+        await client.join_chat(invite_link)
+    finally:
+        with contextlib.suppress(Exception):
+            await client.stop()
 
 
-@app.on_message(filters.text & ~filters.command("start"))
-async def message_handler(_: Client, message: Message) -> None:
-    state = user_states.setdefault(message.from_user.id, UserState())
+def _parse_public_link(link: str) -> tuple[str | int, int]:
+    cleaned = link.replace("https://t.me/", "").strip("/")
+    parts = [part for part in cleaned.split("/") if part]
+    if len(parts) < 2:
+        raise ValueError("Invalid link")
 
-    if state.stage == "session_verification":
-        await handle_session_verification(message, state)
+    if parts[0] == "c" and len(parts) >= 3:
+        chat_id = int(f"-100{parts[1]}")
+        message_id = int(parts[2])
+    else:
+        chat_id = parts[0].lstrip("@")
+        message_id = int(parts[1])
+    return chat_id, message_id
+
+
+def _parse_private_link(link: str) -> tuple[int, int]:
+    cleaned = link.replace("https://t.me/c/", "")
+    parts = cleaned.split("/")
+    if len(parts) < 2:
+        raise ValueError("Invalid link")
+    chat_id = int(f"-100{parts[0]}")
+    return chat_id, int(parts[1])
+
+
+@app.on_message(filters.command("set_session"))
+@safe_handler
+async def set_session_group(_: Client, message: Message) -> None:
+    if not is_owner(message.from_user.id if message.from_user else None):
+        return
+    if not await _ensure_admin(message.chat.id):
+        await message.reply_text("Make me admin in this group first.")
+        return
+    await config_store.set_session_group(message.chat.id)
+    await message.reply_text("✅ Session group set successfully")
+
+
+@app.on_message(filters.command("set_log"))
+@safe_handler
+async def set_log_group(_: Client, message: Message) -> None:
+    if not is_owner(message.from_user.id if message.from_user else None):
+        return
+    if not await _ensure_admin(message.chat.id):
+        await message.reply_text("Make me admin in this group first.")
+        return
+    await config_store.set_logs_group(message.chat.id)
+    await message.reply_text("✅ Logs group set successfully")
+
+
+@app.on_message(filters.command("broadcast"))
+@safe_handler
+async def broadcast(_: Client, message: Message) -> None:
+    if not is_owner(message.from_user.id if message.from_user else None):
         return
 
-    if state.target_type == "private":
-        await validate_private_target(message, state)
+    logs_group = await config_store.logs_group()
+    if not logs_group or message.chat.id != logs_group:
         return
 
-    if state.target_type == "public":
-        await validate_public_target(message, state)
+    payload = message.text.split(" ", 1)
+    if len(payload) < 2:
+        await message.reply_text("Usage: /broadcast <message>")
         return
 
-    await message.reply_text("Use /start to initiate the flow.", reply_markup=TARGET_MENU)
+    text = payload[1]
+    chats = await config_store.known_chats()
+    user_count = 0
+    group_count = 0
+    start = monotonic()
+    for chat_id in chats:
+        try:
+            await app.send_message(chat_id, text)
+            if chat_id > 0:
+                user_count += 1
+            else:
+                group_count += 1
+        except Exception:
+            continue
+    elapsed = int(monotonic() - start)
+    await _send_log(
+        "📢 Broadcast Sent\n"
+        f"🧑 Users: {user_count}\n"
+        f"👥 Groups: {group_count}\n"
+        f"⏱️ Time: {elapsed}s"
+    )
+
+
+@app.on_message(filters.group & filters.text)
+@safe_handler
+async def session_ingestion(_: Client, message: Message) -> None:
+    session_group = await config_store.session_group()
+    if not session_group or message.chat.id != session_group:
+        return
+    if not is_owner(message.from_user.id if message.from_user else None):
+        return
+
+    sessions = session_strings_from_text(message.text or "")
+    if not sessions:
+        return
+
+    valid, invalid = await validate_sessions(config.API_ID, config.API_HASH, sessions)
+    if not valid:
+        await message.reply_text("❌ Invalid session string")
+        return
+
+    await datastore.add_sessions(valid, added_by=message.from_user.id if message.from_user else None)
+    await message.reply_text("✅ Session added successfully")
+    if invalid:
+        await message.reply_text("❌ Invalid session string")
+
+
+@app.on_callback_query(filters.regex("^owner:(manage|set_session_group|set_logs_group)$"))
+@safe_handler
+async def owner_actions(_: Client, query: CallbackQuery) -> None:
+    if not is_owner(query.from_user.id if query.from_user else None):
+        await query.answer("Owner only", show_alert=True)
+        return
+    await query.answer()
+    action = query.data.split(":")[-1]
+    if action == "manage":
+        sessions = await _prune_sessions()
+        lines = [f"Total valid sessions: {len(sessions)}"]
+        if sessions:
+            lines.append("Sessions are added via the configured session group.")
+        await query.message.reply_text("\n".join(lines))
+    elif action == "set_session_group":
+        await query.message.reply_text(
+            "Make bot admin in session group and send /set_session command here"
+        )
+    elif action == "set_logs_group":
+        await query.message.reply_text("Make bot admin in logs group and send /set_log command here")
 
 
 if __name__ == "__main__":

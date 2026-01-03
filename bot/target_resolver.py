@@ -448,8 +448,6 @@ async def resolve_peer(client: Any, target_spec: TargetSpec, *, max_attempts: in
         except (UsernameNotOccupied, UsernameInvalid, PeerIdInvalid, ChannelInvalid, ChannelPrivate, ChatIdInvalid) as exc:
             last_error = exc.__class__.__name__
             resolved = ResolvedTarget(ok=False, peer=None, chat_id=None, method=method, error=last_error)
-            if last_error in _FATAL_ERRORS:
-                _cache_resolution(target_spec, resolved, failure=True)
             return resolved
         except BadRequest as exc:
             last_error = exc.__class__.__name__
@@ -492,6 +490,7 @@ async def resolve_entity(client: Any, target_spec: TargetSpec, *, max_attempts: 
         join_result = await ensure_join_if_needed(client, target_spec)
         if not join_result.ok:
             return ResolvedTarget(ok=False, peer=None, chat_id=None, method="ensure_join", error=join_result.reason)
+        _FAILURE_CACHE.pop(target_spec.cache_key(), None)
 
     resolved = _get_cached_resolution(target_spec)
     if resolved:

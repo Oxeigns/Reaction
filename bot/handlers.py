@@ -49,6 +49,7 @@ from bot.target_resolver import (
     resolve_entity,
 )
 from bot.health import format_duration, process_health
+from bot.progress_ui import run_progress_animation
 from bot.scheduler import SchedulerManager
 from bot.reporting import run_report_job
 from bot.state import (
@@ -1605,14 +1606,77 @@ async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE
         await safe_edit_message(query, "Canceled. Use /report to start over.")
         return ConversationHandler.END
 
-    await safe_edit_message(query, "Reporting has started. I'll send updates when done.")
+    progress_message = await safe_edit_message(query, "Starting report…", reply_markup=None)
 
     job_data = deepcopy(flow_state(context))
-
     context.user_data["last_report_config"] = deepcopy(job_data)
 
-    task = context.application.create_task(run_report_job(query, context, job_data))
-    context.user_data["active_report_task"] = task
+    progress_state = {
+        "joined": 0,
+        "already": 0,
+        "total": len(job_data.get("sessions", []) or []),
+        "resolved": False,
+    }
+
+    stop_event = asyncio.Event()
+
+    animation_task = context.application.create_task(
+        run_progress_animation(
+            context.bot,
+            progress_message.chat_id,
+            progress_message.message_id,
+            stop_event,
+            title="Processing report",
+            details=lambda: progress_state,
+        )
+    )
+
+    async def _status_hook(payload: dict) -> None:
+        join_info = payload.get("join", {}) if isinstance(payload, dict) else {}
+        progress_state["total"] = max(progress_state.get("total", 0), join_info.get("total", 0))
+        progress_state["joined"] = join_info.get("joined", progress_state.get("joined", 0))
+
+        client_states = (payload.get("report") or {}).get("clients", {}) if isinstance(payload, dict) else {}
+        progress_state["already"] = len(
+            [1 for info in client_states.values() if info.get("reason") == "already_participant"]
+        )
+        progress_state["resolved"] = bool((payload.get("target") or {}).get("validated"))
+
+    try:
+        summary = await run_report_job(
+            query,
+            context,
+            job_data,
+            status_message=progress_message,
+            send_progress_updates=False,
+            suppress_final_message=True,
+            status_hook=_status_hook,
+        )
+        ok = summary.get("total_success", 0)
+        fail = summary.get("total_failed", 0)
+        total = ok + fail
+        final_text = (
+            "✅ Done!\n"
+            f"Reports sent: {ok}/{total or 1}\n"
+            f"Failed: {fail}\n"
+            f"If failed: {summary.get('last_error') or 'None'}\n"
+            f"(Joined: {progress_state.get('joined', 0)}, Already in: {progress_state.get('already', 0)})"
+        )
+    except Exception as exc:  # noqa: BLE001
+        logging.exception("Reporting task failed")
+        final_text = f"❌ Reporting failed: {exc}"
+    finally:
+        stop_event.set()
+        with contextlib.suppress(Exception):
+            await animation_task
+
+    with contextlib.suppress(Exception):
+        await context.bot.edit_message_text(
+            chat_id=progress_message.chat_id,
+            message_id=progress_message.message_id,
+            text=final_text,
+        )
+
     clear_report_state(context)
     return ConversationHandler.END
 

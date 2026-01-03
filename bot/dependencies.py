@@ -20,9 +20,18 @@ def ensure_token() -> str:
 
 
 def ensure_pyrogram_creds() -> None:
+    """Guard that API credentials exist and look usable.
+
+    Session strings on their own are not enough to talk to Telegram: the
+    API ID/Hash pair used to create those sessions must also be configured on
+    the worker. This check fails fast with a clear message instead of letting
+    Pyrogram crash later with ``API_ID_INVALID``.
+    """
+
     if not (API_ID and API_HASH):
         raise RuntimeError(
-            "API_ID and API_HASH are required for Pyrogram sessions. Provide valid values via environment variables."
+            "API_ID and API_HASH are required. Set valid values from https://my.telegram.org; "
+            "session strings alone cannot replace them."
         )
 
 

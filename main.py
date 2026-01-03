@@ -8,6 +8,7 @@ import logging
 import signal
 
 from pyrogram import idle
+from pyrogram.errors import ApiIdInvalid, BadRequest
 
 from handlers import register_handlers
 from session_bot import create_bot
@@ -19,7 +20,18 @@ async def start_bot() -> None:
     app, persistence, states, queue = create_bot()
     register_handlers(app, persistence, states, queue)
 
-    await app.start()
+    try:
+        await app.start()
+    except ApiIdInvalid:
+        logging.error(
+            "Telegram rejected API_ID/API_HASH. Set valid values from https://my.telegram.org; "
+            "session strings alone cannot be used without working API credentials."
+        )
+        return
+    except BadRequest as exc:
+        logging.error("Failed to start bot: %s", exc)
+        return
+
     logging.info("Bot started and ready.")
 
     shutdown_event = asyncio.Event()

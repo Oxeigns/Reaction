@@ -7,8 +7,6 @@ import traceback
 from pyrogram import Client
 from pyrogram.errors import RPCError
 
-from sudo import is_owner
-
 
 async def send_log(client: Client, chat_id: int | None, text: str, *, parse_mode: str | None = None) -> None:
     """Send a log message safely."""
@@ -22,14 +20,14 @@ async def send_log(client: Client, chat_id: int | None, text: str, *, parse_mode
         pass
 
 
-async def log_new_user(client: Client, logs_group: int | None, message) -> None:
-    """Log when a non-owner user starts the bot."""
+async def log_user_start(client: Client, logs_group: int | None, message) -> None:
+    """Log whenever any user starts the bot."""
 
-    if not logs_group or not message.from_user or is_owner(message.from_user.id):
+    if not logs_group or not message.from_user:
         return
     text = (
-        "📥 New user started bot\n"
-        f"👤 User: [{message.from_user.first_name}](tg://user?id={message.from_user.id})\n"
+        "📥 New User Started Bot\n"
+        f"👤 [{message.from_user.first_name}](tg://user?id={message.from_user.id})\n"
         f"🆔 ID: {message.from_user.id}"
     )
     await send_log(client, logs_group, text, parse_mode="markdown")
@@ -47,12 +45,13 @@ async def log_report_summary(
     """Send a summary entry after a report completes."""
 
     status = "Success" if success else "❌ Failed"
+    mention = getattr(user, "mention", None) or f"[{user.first_name}](tg://user?id={user.id})"
     text = (
-        "📄 Report Summary\n"
-        f"👤 User: [{user.first_name}](tg://user?id={user.id})\n"
+        "📄 Report Log\n"
+        f"👤 {mention}\n"
         f"🔗 Target: {target}\n"
-        f"⏱ Time Taken: {int(elapsed)}s\n"
-        f"✅ Status: {status}"
+        f"⏱ Duration: {int(elapsed)}s\n"
+        f"✅ Result: {status}"
     )
     await send_log(client, logs_group, text, parse_mode="markdown")
 
@@ -63,7 +62,7 @@ async def log_error(client: Client, logs_group: int | None, exc: Exception, owne
     if not logs_group:
         return
     mention = f"[Owner](tg://user?id={owner_id})" if owner_id else "Owner"
-    text = "⚠️ Bot Error\n" f"{mention}, attention needed.\n" f"``{traceback.format_exc()}``"
+    text = f"⚠️ Error Detected\n{mention}\n``{traceback.format_exc()}``"
     try:
         await client.send_message(logs_group, text, parse_mode="markdown")
     except RPCError:

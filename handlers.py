@@ -13,9 +13,9 @@ from pyrogram.errors import RPCError
 from pyrogram.types import CallbackQuery, Message
 
 import config
-from logging_utils import log_error, log_new_user, log_report_summary, send_log
+from logging_utils import log_error, log_report_summary, log_user_start, send_log
 from report import send_report
-from session_bot import extract_sessions_from_text, prune_sessions, validate_sessions
+from session_bot import extract_sessions_from_text, is_session_string, prune_sessions, validate_sessions
 from state import QueueEntry, ReportQueue, StateManager
 from sudo import is_owner, is_sudo
 from ui import REPORT_REASONS, owner_panel, queued_message, reason_keyboard, report_type_keyboard, sudo_panel
@@ -60,40 +60,40 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
             return
 
         user_id = message.from_user.id
+        await persistence.add_known_chat(message.chat.id)
+        await log_user_start(app, await persistence.logs_group(), message)
+
         if not is_sudo(user_id):
-            await message.reply_text("This bot is for the owner and sudo users only. Contact the owner for access.")
+            await message.reply_text("Access Denied: This bot is not for public use.")
             return
 
-        await persistence.add_known_chat(message.chat.id)
         live_sessions = await prune_sessions(persistence)
-        session_group = await persistence.session_group()
 
         if is_owner(user_id):
             if not live_sessions:
-                target_group_note = (
-                    f" (Session manager group: {session_group})" if session_group else ""
+                await message.reply_text(
+                    "You need to set sessions first.\nPlease send valid Pyrogram session strings in the Session Manager Group.",
                 )
-                hint = (
-                    "Please send a Pyrogram session string in the session manager group to enable reporting."
-                    f"{target_group_note}"
+                await message.reply_text(
+                    "Owner Control Panel",
+                    reply_markup=owner_panel(len(live_sessions)),
                 )
-                await message.reply_text(hint)
                 return
 
             await message.reply_text(
-                f"Owner control panel\nLive sessions: {len(live_sessions)} available",
+                f"Owner Control Panel\nLive sessions: {len(live_sessions)}",
                 reply_markup=owner_panel(len(live_sessions)),
             )
-            return
-
-        await log_new_user(app, await persistence.logs_group(), message)
-        if not live_sessions:
-            await message.reply_text("No active sessions available. Contact the owner to add sessions in the session manager group.")
-            return
-        await message.reply_text(
-            f"Live sessions: {len(live_sessions)} available",
-            reply_markup=sudo_panel(len(live_sessions)),
-        )
+        else:
+            if not live_sessions:
+                await message.reply_text(
+                    "No sessions available.\nPlease contact the bot owner to add valid sessions.",
+                )
+                return
+            await message.reply_text(
+                f"Live sessions: {len(live_sessions)}",
+                reply_markup=sudo_panel(len(live_sessions)),
+            )
 
     @app.on_message(filters.command("addsudo"))
     async def add_sudo(_: Client, message: Message) -> None:
@@ -169,21 +169,23 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
             await query.answer("Unauthorized", show_alert=True)
             return
 
-        checking = await query.message.reply_text("Please wait while we check available sessions...")
-        live_sessions = await prune_sessions(persistence)
+        checking = await query.message.reply_text("Please wait... validating sessions")
+        live_sessions = await prune_sessions(persistence, announce=True)
         if not live_sessions:
-            await checking.edit_text("No valid sessions available. Contact the owner to add more.")
+            await checking.edit_text("No sessions available.\nPlease contact the bot owner to add valid sessions.")
             return
 
         if queue.is_busy() and queue.active_user != query.from_user.id:
             position = queue.expected_position(query.from_user.id)
-            await query.message.reply_text(queued_message(position))
+            notice = queued_message(position)
+            if notice:
+                await query.message.reply_text(notice)
 
         state = states.get(query.from_user.id)
         state.reset()
         state.stage = "type"
-        await checking.edit_text(f"Live sessions: {len(live_sessions)} available")
-        await query.message.reply_text("Choose report type", reply_markup=report_type_keyboard())
+        await checking.edit_text(f"Live sessions: {len(live_sessions)}")
+        await query.message.reply_text("Select Report Type", reply_markup=report_type_keyboard())
         await query.answer()
 
     @app.on_callback_query(filters.regex(r"^report:type:(public|private)$"))
@@ -259,9 +261,16 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
         state.stage = "queued"
         state.started_at = monotonic()
 
+        if queue.is_busy() and queue.active_user != message.from_user.id:
+            notice = queued_message(queue.expected_position(message.from_user.id))
+            if notice:
+                await message.reply_text(notice)
+
         async def notify_position(position: int) -> None:
             if position > 1:
-                await message.reply_text(queued_message(position))
+                notice = queued_message(position)
+                if notice:
+                    await message.reply_text(notice)
 
         entry = QueueEntry(
             message.from_user.id,
@@ -349,7 +358,7 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
             return
         await persistence.set_session_group(message.chat.id)
         await persistence.add_known_chat(message.chat.id)
-        await message.reply_text("Session group set successfully")
+        await message.reply_text("Session Manager Group set successfully.")
 
     @app.on_message(filters.command("set_log"))
     async def set_log(_: Client, message: Message) -> None:
@@ -395,10 +404,10 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
                 continue
         elapsed = round(monotonic() - start_time, 2)
         summary = (
-            "📢 Broadcast Summary\n"
-            f"👤 Sent to Users: {user_count}\n"
-            f"👥 Sent to Groups: {group_count}\n"
-            f"⏱ Time: {elapsed}s"
+            "📢 Broadcast Completed\n"
+            f"👤 Users: {user_count}\n"
+            f"👥 Groups: {group_count}\n"
+            f"⏱ Duration: {elapsed}s"
         )
         await send_log(app, logs_group, summary)
 
@@ -413,29 +422,25 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
         if not message.from_user:
             return
         if not is_owner(message.from_user.id):
-            await message.reply_text("Only the owner can add or validate sessions in this group.")
             return
 
         sessions = extract_sessions_from_text(message.text or "")
-        if not sessions:
-            await message.reply_text("No Pyrogram session strings found. Send a valid session to save.")
+        if not sessions or not all(is_session_string(s) for s in sessions):
+            await message.reply_text("❌ Invalid session string")
             return
         valid, invalid = await validate_sessions(sessions)
         logs_group = await persistence.logs_group()
-        response_parts = []
         if valid:
             await persistence.add_sessions(valid, added_by=message.from_user.id)
-            response_parts.append("Session string saved and activated automatically")
+            await message.reply_text("✅ Session saved successfully")
             await send_log(
                 app,
                 logs_group,
                 f"{len(valid)} session(s) added from the session manager group.",
             )
         if invalid:
-            response_parts.append("Invalid session string. Please resend a valid Pyrogram session.")
+            await message.reply_text("❌ Session is invalid or expired")
             await send_log(app, logs_group, f"Ignored {len(invalid)} invalid session strings.")
-        if response_parts:
-            await message.reply_text("\n".join(response_parts))
 
     @app.on_callback_query(filters.regex(r"^owner:(manage|set_session_group|set_logs_group)$"))
     async def owner_actions(_: Client, query: CallbackQuery) -> None:

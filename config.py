@@ -5,6 +5,10 @@ from __future__ import annotations
 All sensitive values are sourced from environment variables. If required
 credentials are missing or malformed, the bot will exit early with a clear
 message instead of crashing later with a Telegram RPC error.
+
+The values stored here are the *initial* configuration only. Mutable
+configuration such as session/log group ids must be persisted by the datastore
+so that runtime changes survive restarts.
 """
 
 import os
@@ -39,6 +43,10 @@ API_ID: Final[int | None] = _int_env("API_ID")
 API_HASH: Final[str | None] = _text_env("API_HASH")
 
 MONGO_URI: Final[str | None] = _text_env("MONGO_URI")
+
+# Optional defaults for group ids; runtime changes are persisted separately.
+SESSION_GROUP_ID: Final[int | None] = _int_env("SESSION_GROUP_ID")
+LOGS_GROUP_ID: Final[int | None] = _int_env("LOGS_GROUP_ID")
 
 # Comma-separated Telegram user IDs that are allowed to issue admin commands
 # (e.g., /restart). Example: ADMIN_IDS="123,456".

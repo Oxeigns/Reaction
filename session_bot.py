@@ -64,7 +64,13 @@ def extract_sessions_from_text(text: str) -> list[str]:
     """Parse potential session strings from raw text."""
 
     candidates = [part.strip() for part in text.split() if len(part.strip()) > 50]
-    return [candidate for candidate in candidates if ":" in candidate or len(candidate) > 80]
+    return [candidate for candidate in candidates if is_session_string(candidate)]
+
+
+def is_session_string(text: str) -> bool:
+    """Heuristically determine if text looks like a Pyrogram session string."""
+
+    return bool(text and (":" in text or len(text) > 80))
 
 
 def create_bot() -> tuple[Client, object, StateManager, ReportQueue]:

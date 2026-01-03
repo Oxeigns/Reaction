@@ -6,6 +6,8 @@ import logging
 import os
 from typing import Iterable
 
+import config
+
 
 class DataStore:
     """Persist session strings, chat configuration, and report audit records."""
@@ -23,7 +25,10 @@ class DataStore:
         self.mongo_uri = mongo_uri or os.getenv(self.mongo_env_var, "")
         self._in_memory_sessions: set[str] = set()
         self._in_memory_reports: list[dict] = []
-        self._in_memory_config: dict[str, int | None] = {"session_group": None, "logs_group": None}
+        self._in_memory_config: dict[str, int | None] = {
+            "session_group": config.SESSION_GROUP_ID,
+            "logs_group": config.LOGS_GROUP_ID,
+        }
         self._in_memory_chats: set[int] = set()
 
         self.client = client

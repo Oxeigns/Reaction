@@ -16,9 +16,11 @@ REPORT_REASONS = {
 
 
 def owner_panel(live_count: int) -> InlineKeyboardMarkup:
+    """Owner dashboard with management shortcuts."""
+
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton(f"▶️ Start Report ({live_count})", callback_data="sudo:start")],
+            [InlineKeyboardButton("🚀 Start Report", callback_data="sudo:start")],
             [InlineKeyboardButton("✅ Manage Sessions", callback_data="owner:manage")],
             [InlineKeyboardButton("➕ Set Session Group", callback_data="owner:set_session_group")],
             [InlineKeyboardButton("📝 Set Logs Group", callback_data="owner:set_logs_group")],
@@ -26,10 +28,10 @@ def owner_panel(live_count: int) -> InlineKeyboardMarkup:
     )
 
 
-def sudo_panel(live_count: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton(f"Start Report", callback_data="sudo:start")]]
-    )
+def sudo_panel(_: int) -> InlineKeyboardMarkup:
+    """Panel for sudo users to begin a report."""
+
+    return InlineKeyboardMarkup([[InlineKeyboardButton("Start Report", callback_data="sudo:start")]])
 
 
 def report_type_keyboard() -> InlineKeyboardMarkup:
@@ -49,5 +51,11 @@ def reason_keyboard() -> InlineKeyboardMarkup:
 
 
 def queued_message(position: int) -> str:
-    return f"Report in progress. You are in queue position #{position}. Please wait..."
+    """User-facing queue notification."""
+
+    return (
+        f"Another report is in progress. Your request is queued. Position: #{position}"
+        if position > 1
+        else ""
+    )
 

@@ -45,6 +45,12 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
             logging.exception("Handler error")
             await log_error(app, await persistence.logs_group(), exc, config.OWNER_ID)
 
+    async def _owner_guard(message: Message) -> bool:
+        if not message.from_user or not is_owner(message.from_user.id):
+            await message.reply_text("Only the owner can manage sudo users.")
+            return False
+        return True
+
     @app.on_message(filters.command("start"))
     async def start_handler(_: Client, message: Message) -> None:
         await _wrap_errors(_handle_start, message)
@@ -59,7 +65,10 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
         live_sessions = await prune_sessions(persistence)
 
         if is_owner(user_id):
-            await message.reply_text("Owner control panel", reply_markup=owner_panel())
+            await message.reply_text(
+                f"Owner control panel\nLive sessions: {len(live_sessions)} available",
+                reply_markup=owner_panel(len(live_sessions)),
+            )
             return
 
         await log_new_user(app, await persistence.logs_group(), message)
@@ -67,6 +76,69 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
             f"Live sessions: {len(live_sessions)} available",
             reply_markup=sudo_panel(len(live_sessions)),
         )
+
+    @app.on_message(filters.command("addsudo"))
+    async def add_sudo(_: Client, message: Message) -> None:
+        await _wrap_errors(_handle_add_sudo, message)
+
+    async def _handle_add_sudo(message: Message) -> None:
+        if not await _owner_guard(message):
+            return
+
+        parts = (message.text or "").split(maxsplit=2)
+        if len(parts) < 2 or not parts[1].isdigit():
+            await message.reply_text("Usage: /addsudo <user_id> [username]")
+            return
+
+        user_id = int(parts[1])
+        if is_owner(user_id):
+            await message.reply_text("Owner already has access.")
+            return
+        if user_id in config.SUDO_USERS:
+            await message.reply_text("User is already a sudo user.")
+            return
+
+        config.SUDO_USERS.add(user_id)
+        label = parts[2] if len(parts) > 2 else str(user_id)
+        await message.reply_text(f"Added {label} ({user_id}) to sudo users.")
+
+    @app.on_message(filters.command("rmsudo"))
+    async def remove_sudo(_: Client, message: Message) -> None:
+        await _wrap_errors(_handle_remove_sudo, message)
+
+    async def _handle_remove_sudo(message: Message) -> None:
+        if not await _owner_guard(message):
+            return
+
+        parts = (message.text or "").split(maxsplit=2)
+        if len(parts) < 2 or not parts[1].isdigit():
+            await message.reply_text("Usage: /rmsudo <user_id>")
+            return
+
+        user_id = int(parts[1])
+        if user_id not in config.SUDO_USERS:
+            await message.reply_text("User is not in the sudo list.")
+            return
+
+        config.SUDO_USERS.discard(user_id)
+        await message.reply_text(f"Removed {user_id} from sudo users.")
+
+    @app.on_message(filters.command("sudolist"))
+    async def sudo_list(_: Client, message: Message) -> None:
+        await _wrap_errors(_handle_sudo_list, message)
+
+    async def _handle_sudo_list(message: Message) -> None:
+        if not await _owner_guard(message):
+            return
+
+        sudo_users = sorted(config.SUDO_USERS)
+        if not sudo_users:
+            await message.reply_text("No sudo users configured.")
+            return
+
+        entries = [f"- {user_id}" for user_id in sudo_users]
+        text = "Current sudo users:\n" + "\n".join(entries)
+        await message.reply_text(text)
 
     @app.on_callback_query(filters.regex(r"^sudo:start$"))
     async def start_report(_: Client, query: CallbackQuery) -> None:

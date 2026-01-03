@@ -15,9 +15,10 @@ REPORT_REASONS = {
 }
 
 
-def owner_panel() -> InlineKeyboardMarkup:
+def owner_panel(live_count: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
+            [InlineKeyboardButton(f"▶️ Start Report ({live_count})", callback_data="sudo:start")],
             [InlineKeyboardButton("✅ Manage Sessions", callback_data="owner:manage")],
             [InlineKeyboardButton("➕ Set Session Group", callback_data="owner:set_session_group")],
             [InlineKeyboardButton("📝 Set Logs Group", callback_data="owner:set_logs_group")],

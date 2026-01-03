@@ -1,9 +1,11 @@
+# handlers.py
 from __future__ import annotations
 
 """Command and callback handlers for the reporting bot."""
 
 import contextlib
 import logging
+from io import BytesIO
 from time import monotonic
 from typing import Callable, Tuple
 
@@ -19,6 +21,17 @@ from session_bot import extract_sessions_from_text, prune_sessions, validate_ses
 from state import QueueEntry, ReportQueue, StateManager
 from sudo import is_owner
 from ui import REPORT_REASONS, owner_panel, queued_message, reason_keyboard, report_type_keyboard, sudo_panel
+
+
+def _normalize_chat_id(value) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
 
 
 def register_handlers(app: Client, persistence, states: StateManager, queue: ReportQueue) -> None:
@@ -94,7 +107,6 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
             await _log_stage("Sudo Start", f"Sudo {user_id} opened start panel")
             return
 
-        print(f"[DEBUG] Unauthorized start from user {user_id}")
         await message.reply_text("You are not authorized.")
         await _log_stage("Unauthorized", f"User {user_id} attempted /start")
 
@@ -238,7 +250,8 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
         await _log_stage("Report Reason", f"User {query.from_user.id} selected {label}")
         await _begin_report(query.message, state)
 
-    @app.on_message(filters.text & ~filters.command(["start", "broadcast", "set_session", "set_log"]))
+    # IMPORTANT: Report flow is expected in DM, not groups.
+    @app.on_message(filters.private & filters.text & ~filters.command(["start", "broadcast", "set_session", "set_log"]))
     async def text_router(_: Client, message: Message) -> None:
         await _wrap_errors(_handle_text, message)
 
@@ -246,26 +259,28 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
         if not message.from_user:
             return
         if not await _is_sudo_user(message.from_user.id):
-            print(f"[DEBUG] Unauthorized text from {message.from_user.id}")
             await message.reply_text("You are not authorized to use this bot.")
             await _log_stage("Unauthorized", f"User {message.from_user.id} attempted text routing")
             return
+
         state = states.get(message.from_user.id)
         if state.stage == "awaiting_link":
-            if not _is_valid_link(message.text):
+            if not _is_valid_link(message.text or ""):
                 await message.reply_text("Send a valid https://t.me/ link.")
                 return
-            state.target_link = message.text.strip()
+            state.target_link = (message.text or "").strip()
             state.stage = "awaiting_reason"
             await message.reply_text("Choose a report reason", reply_markup=reason_keyboard())
             await _log_stage("Target Link", f"User {message.from_user.id} provided link {state.target_link}")
             return
+
         if state.stage == "awaiting_reason":
-            state.reason_text = message.text.strip()
+            state.reason_text = (message.text or "").strip()
             state.reason_code = 9
             await _log_stage("Custom Reason", f"User {message.from_user.id} provided custom reason")
             await _begin_report(message, state)
             return
+
         await message.reply_text("Use Start Report to begin a new report.")
 
     async def _begin_report(message: Message | None, state) -> None:
@@ -382,7 +397,6 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
 
     async def _handle_set_session(message: Message) -> None:
         if not message.from_user or not is_owner(message.from_user.id):
-            print("[DEBUG] Unauthorized set_session attempt")
             await message.reply_text("Only the owner can set the session manager group.")
             return
         await persistence.save_session_group_id(message.chat.id)
@@ -390,13 +404,18 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
         await message.reply_text("✅ Session group set.")
         await _log_stage("Session Group Set", f"Session group updated to {message.chat.id}")
 
+        if not await _ensure_admin(message.chat.id):
+            await _log_stage(
+                "Warning",
+                "Bot is not admin in session group. If BotFather privacy is ON, bot may not receive session texts.",
+            )
+
     @app.on_message(filters.command("set_log") & filters.group)
     async def set_log(_: Client, message: Message) -> None:
         await _wrap_errors(_handle_set_log, message)
 
     async def _handle_set_log(message: Message) -> None:
         if not message.from_user or not is_owner(message.from_user.id):
-            print("[DEBUG] Unauthorized set_log attempt")
             await message.reply_text("Only the owner can set the logs group.")
             return
         await persistence.save_logs_group_id(message.chat.id)
@@ -410,13 +429,11 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
 
     async def _handle_broadcast(message: Message) -> None:
         if not message.from_user or not is_owner(message.from_user.id):
-            print("[DEBUG] Unauthorized broadcast attempt")
             return
-        logs_group = await persistence.get_logs_group_id()
+        logs_group = _normalize_chat_id(await persistence.get_logs_group_id())
         if not logs_group or message.chat.id != logs_group:
-            print("[DEBUG] Broadcast called outside logs group")
             return
-        payload = message.text.split(" ", 1)
+        payload = (message.text or "").split(" ", 1)
         if len(payload) < 2:
             await message.reply_text("Usage: /broadcast <message>")
             return
@@ -445,42 +462,64 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
         await send_log(app, logs_group, summary)
         await message.reply_text(summary)
 
-    @app.on_message(filters.group & (filters.text | filters.caption))
+    @app.on_message(filters.group & (filters.text | filters.caption | filters.document), group=-5)
     async def session_ingestion(_: Client, message: Message) -> None:
         await _wrap_errors(_handle_session_ingestion, message)
 
+    async def _read_document_text(message: Message) -> str:
+        if not message.document:
+            return ""
+        try:
+            bio = await message.download(in_memory=True)
+            if isinstance(bio, BytesIO):
+                return bio.getvalue().decode("utf-8", errors="ignore")
+            return ""
+        except Exception:
+            return ""
+
     async def _handle_session_ingestion(message: Message) -> None:
-        session_group = await persistence.get_session_group_id()
+        session_group = _normalize_chat_id(await persistence.get_session_group_id())
         if not session_group:
-            print("[DEBUG] Session group id not configured")
+            await _log_stage("Session Intake Skip", "Session group id not configured")
             return
         if message.chat.id != session_group:
-            print(f"[DEBUG] Session message in non-session group {message.chat.id}")
             return
         if not message.from_user:
             return
         if not is_owner(message.from_user.id):
-            print(f"[DEBUG] Non-owner {message.from_user.id} attempted session save")
+            await _log_stage("Session Intake Denied", f"Non-owner {message.from_user.id} tried to add sessions")
             return
 
         text_content = message.text or message.caption or ""
+        if not text_content and message.document:
+            text_content = await _read_document_text(message)
+
         sessions = extract_sessions_from_text(text_content)
         if not sessions:
-            print("[DEBUG] No sessions found in message text")
             await message.reply("❌ Invalid")
             await _log_stage("Session Intake", "No valid sessions found in message")
             return
+
+        saved_any = False
+        invalid_any = False
 
         for session in sessions:
             if await validate_session_string(session):
                 try:
                     await persistence.add_sessions([session], added_by=message.from_user.id)
-                    await message.reply("✅ Saved")
+                    saved_any = True
                 except Exception as exc:  # noqa: BLE001
-                    print(f"[DEBUG] Session save failed: {exc}")
-                    await message.reply("❌ Failed to save session")
+                    invalid_any = True
+                    await _log_stage("Session Save Failed", f"{exc}")
             else:
-                await message.reply("❌ Invalid")
+                invalid_any = True
+
+        if saved_any and not invalid_any:
+            await message.reply("✅ Saved")
+        elif saved_any and invalid_any:
+            await message.reply("⚠️ Partial: some saved, some invalid/failed")
+        else:
+            await message.reply("❌ Invalid")
 
     @app.on_callback_query(filters.regex(r"^owner:(manage|set_session_group|set_logs_group)$"))
     async def owner_actions(_: Client, query: CallbackQuery) -> None:
@@ -510,16 +549,20 @@ def _parse_link(link: str, is_private: bool) -> Tuple[str | int, int]:
     parts = [part for part in cleaned.split("/") if part]
     if len(parts) < 2:
         raise ValueError("Invalid link")
+
     if is_private:
-        # Private links are typically t.me/c/<internal_id>/<message_id>
-        if parts[0] != "c" and not parts[0].isdigit():
-            raise ValueError("Invalid private link")
+        # Private links: t.me/c/<internal_id>/<message_id>
         if parts[0] == "c":
-            chat_id = int(f"-100{parts[1]}") if len(parts) > 2 else int(f"-100{parts[0]}")
-            message_id = int(parts[-1])
-        else:
-            chat_id = int(f"-100{parts[0]}")
-            message_id = int(parts[1])
+            if len(parts) < 3:
+                raise ValueError("Invalid private link")
+            chat_id = int(f"-100{parts[1]}")
+            message_id = int(parts[2])
+            return chat_id, message_id
+
+        if not parts[0].isdigit():
+            raise ValueError("Invalid private link")
+        chat_id = int(f"-100{parts[0]}")
+        message_id = int(parts[1])
         return chat_id, message_id
 
     if parts[0] == "c" and len(parts) >= 3:
@@ -529,4 +572,3 @@ def _parse_link(link: str, is_private: bool) -> Tuple[str | int, int]:
         chat_id = parts[0].lstrip("@")
         message_id = int(parts[1])
     return chat_id, message_id
-

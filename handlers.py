@@ -346,7 +346,7 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
                     await client.stop()
         return success_any
 
-    @app.on_message(filters.command("set_session"))
+    @app.on_message(filters.command("set_session") & filters.group)
     async def set_session(_: Client, message: Message) -> None:
         await _wrap_errors(_handle_set_session, message)
 
@@ -358,9 +358,11 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
             return
         await persistence.set_session_group(message.chat.id)
         await persistence.add_known_chat(message.chat.id)
-        await message.reply_text("Session Manager Group set successfully.")
+        await message.reply_text(
+            "✅ Session Manager Group set successfully.\nAll session strings sent here will now be processed."
+        )
 
-    @app.on_message(filters.command("set_log"))
+    @app.on_message(filters.command("set_log") & filters.group)
     async def set_log(_: Client, message: Message) -> None:
         await _wrap_errors(_handle_set_log, message)
 
@@ -372,7 +374,9 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
             return
         await persistence.set_logs_group(message.chat.id)
         await persistence.add_known_chat(message.chat.id)
-        await message.reply_text("Logs group set successfully")
+        await message.reply_text(
+            "✅ Logs Group set successfully.\nAll future logs and broadcasts will be sent here."
+        )
 
     @app.on_message(filters.command("broadcast"))
     async def broadcast(_: Client, message: Message) -> None:
@@ -419,24 +423,23 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
         session_group = await persistence.session_group()
         if not session_group or message.chat.id != session_group:
             return
-        if not message.from_user:
+        if not message.from_user or not is_owner(message.from_user.id):
             return
 
         text_content = message.text or message.caption or ""
         sessions = extract_sessions_from_text(text_content)
         if not sessions:
-            await message.reply_text("❌ Invalid session string")
+            await message.reply_text("❌ Invalid session string.")
             return
 
         valid, invalid = await validate_sessions(sessions)
         logs_group = await persistence.logs_group()
 
-        response_parts: list[str] = []
         if valid:
             added = await persistence.add_sessions(valid, added_by=message.from_user.id)
             total_sessions = len(await persistence.get_sessions())
-            response_parts.append(
-                f"✅ Valid sessions: {len(valid)} (added {len(added)})\n📦 Total stored: {total_sessions}"
+            await message.reply_text(
+                f"✅ Session saved.\nTotal valid sessions: {total_sessions}"
             )
             await send_log(
                 app,
@@ -444,11 +447,9 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
                 f"{len(valid)} session(s) added from the session manager group.",
             )
         if invalid:
-            response_parts.append(f"❌ Invalid session(s): {len(invalid)}")
             await send_log(app, logs_group, f"Ignored {len(invalid)} invalid session strings.")
-
-        if response_parts:
-            await message.reply_text("\n".join(response_parts))
+            if not valid:
+                await message.reply_text("❌ Invalid session string.")
 
     @app.on_callback_query(filters.regex(r"^owner:(manage|set_session_group|set_logs_group)$"))
     async def owner_actions(_: Client, query: CallbackQuery) -> None:

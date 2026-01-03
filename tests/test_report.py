@@ -19,14 +19,14 @@ class ResolvePeerForReportTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(peer, -1001234567890)
         self.assertEqual(observed["value"], -1001234567890)
 
-    async def test_non_username_error_bubbles_up(self) -> None:
+    async def test_non_username_error_wraps_value_error(self) -> None:
         class DummyClient:
             async def resolve_peer(self, value):  # type: ignore[no-untyped-def]
                 raise ValueError(f"Peer id invalid: {value}")
 
         client = DummyClient()
 
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(Exception, "Invalid target for reporting"):
             await _resolve_peer_for_report(client, "-100bad")
 
 

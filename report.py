@@ -84,6 +84,10 @@ async def _resolve_peer_for_report(client: Client, chat_id):
     except UsernameInvalid:
         # Continue to raw username resolution below
         pass
+    except ValueError as exc:
+        # Pyrogram raises ``ValueError(Peer id invalid: ...)`` for bad numeric inputs.
+        # Surface a consistent API error so callers can show a friendly message.
+        raise BadRequest(f"Invalid target for reporting: {exc}") from exc
     except Exception:
         # For non-username inputs we want to bubble up the original error
         # instead of masking it with a generic "Unable to resolve" message.

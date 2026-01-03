@@ -31,7 +31,7 @@ async def run_progress_animation(
     frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
     steps: list[SpinnerFrame] = [
         ("🔌", "Connecting sessions"),
-        ("🧭", "Resolving target"),
+        ("🛡️", "Validating target"),
         ("📨", "Submitting reports"),
         ("✅", "Finalizing"),
     ]
@@ -48,6 +48,7 @@ async def run_progress_animation(
         detail_state = details() if details else {}
         joined = detail_state.get("joined", 0)
         already = detail_state.get("already", 0)
+        failed = detail_state.get("failed", 0)
         total = detail_state.get("total", 0)
         resolved = detail_state.get("resolved", False)
 
@@ -55,10 +56,9 @@ async def run_progress_animation(
             f"{frame} {title}\n"
             f"Step: {step_label} {prefix}\n"
             f"Progress: [{bar}] {pct}%\n"
-            f"Sessions: joined {joined}/{total}"
-            f"{f' (already {already})' if already else ''}"
-            f" | ready {joined + already}/{total}"
-            f"\nTarget: {'✅' if resolved else '…'}"
+            f"Sessions: ok {joined + already}/{total} | failed {failed}\n"
+            f"Members: joined {joined}, already in {already}\n"
+            f"Target: {'✅' if resolved else '…'}"
         )
 
         if text != last_text:

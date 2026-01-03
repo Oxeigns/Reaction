@@ -82,6 +82,7 @@ _FATAL_ERRORS = {
     "UsernameNotOccupied",
     "ChannelInvalid",
     "ChatIdInvalid",
+    "invalid_invite",
 }
 
 
@@ -340,6 +341,17 @@ async def ensure_join_if_needed(client: Any, target_spec: TargetSpec) -> JoinRes
                     "error": exc.__class__.__name__,
                 },
             )
+            _cache_resolution(
+                target_spec,
+                ResolvedTarget(
+                    ok=False,
+                    peer=None,
+                    chat_id=None,
+                    method="ensure_join",
+                    error="invalid_invite",
+                ),
+                failure=True,
+            )
             return JoinResult(ok=False, joined=False, reason="invalid_invite", error=str(exc))
         except ChatAdminRequired as exc:
             return JoinResult(ok=False, joined=False, reason="admin_required", error=str(exc))
@@ -448,6 +460,8 @@ async def resolve_peer(client: Any, target_spec: TargetSpec, *, max_attempts: in
         except (UsernameNotOccupied, UsernameInvalid, PeerIdInvalid, ChannelInvalid, ChannelPrivate, ChatIdInvalid) as exc:
             last_error = exc.__class__.__name__
             resolved = ResolvedTarget(ok=False, peer=None, chat_id=None, method=method, error=last_error)
+            if last_error in _FATAL_ERRORS:
+                _cache_resolution(target_spec, resolved, failure=True)
             return resolved
         except BadRequest as exc:
             last_error = exc.__class__.__name__

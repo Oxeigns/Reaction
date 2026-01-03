@@ -37,6 +37,7 @@ from ui import (
     report_type_keyboard,
     sudo_panel,
 )
+from bot.utils import resolve_chat_id
 
 
 def _normalize_chat_id(value) -> int | None:
@@ -90,6 +91,41 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
     async def _sessions_available() -> list[str]:
         sessions = await prune_sessions(persistence, announce=True)
         return sessions
+
+    async def _resolve_target_across_sessions(
+        target_link: str, sessions: list[str]
+    ) -> tuple[int | None, str | None]:
+        """Resolve the target chat id using any available session string.
+
+        This retries across every validated session so private/public links and
+        message links can be resolved even when some sessions are missing
+        access. Returns the resolved chat id or ``None`` plus the last error
+        message for user feedback.
+        """
+
+        last_error: str | None = None
+
+        for idx, session in enumerate(sessions):
+            client = Client(
+                name=f"resolver_{idx}",
+                api_id=config.API_ID,
+                api_hash=config.API_HASH,
+                session_string=session,
+                workdir=f"/tmp/resolver_{idx}",
+            )
+
+            try:
+                await client.start()
+                try:
+                    chat_id = await resolve_chat_id(client, target_link)
+                    return chat_id, None
+                except Exception as exc:  # noqa: BLE001 - need detailed errors
+                    last_error = str(exc)
+            finally:
+                with contextlib.suppress(Exception):
+                    await client.stop()
+
+        return None, last_error
 
     async def _prompt_report_count(message: Message) -> None:
         await message.reply_text(
@@ -776,6 +812,25 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
                 "total_sessions": total_sessions,
                 "requested": requested_count,
             }
+
+        resolved_chat_id, resolution_error = await _resolve_target_across_sessions(
+            state.target_link, sessions
+        )
+        if resolved_chat_id is None:
+            detail = f" Details: {resolution_error}" if resolution_error else ""
+            await message.reply_text(
+                "Unable to resolve the target for reporting. Please verify the link and try again." + detail
+            )
+            return {
+                "any_success": False,
+                "success_count": 0,
+                "failure_count": 0,
+                "attempted": 0,
+                "total_sessions": total_sessions,
+                "requested": requested_count,
+            }
+
+        chat_ref = resolved_chat_id
 
         await _log_stage(
             "Report Started", f"User {message.from_user.id} executing with {len(sessions)} sessions"

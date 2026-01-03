@@ -2,6 +2,7 @@ from __future__ import annotations
 
 """Command and callback handlers for the reporting bot."""
 
+import asyncio
 import contextlib
 import logging
 from io import BytesIO
@@ -19,7 +20,15 @@ from report import send_report
 from session_bot import extract_sessions_from_text, prune_sessions, validate_session_string
 from state import QueueEntry, ReportQueue, StateManager
 from sudo import is_owner
-from ui import REPORT_REASONS, owner_panel, queued_message, reason_keyboard, report_type_keyboard, sudo_panel
+from ui import (
+    REPORT_REASONS,
+    owner_panel,
+    queued_message,
+    reason_keyboard,
+    report_count_keyboard,
+    report_type_keyboard,
+    sudo_panel,
+)
 
 
 def _normalize_chat_id(value) -> int | None:
@@ -69,6 +78,10 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
             f"🛰 {stage}\n{detail}",
         )
 
+    async def _sessions_available() -> list[str]:
+        sessions = await prune_sessions(persistence, announce=True)
+        return sessions
+
     async def _is_sudo_user(user_id: int | None) -> bool:
         if user_id is None:
             return False
@@ -97,16 +110,23 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
         await log_user_start(app, await persistence.get_logs_group_id(), message)
 
         if is_owner(user_id):
-            await message.reply_text("Welcome, Owner!", reply_markup=owner_panel())
+            await message.reply_text(
+                "Welcome, Owner! Choose an action below.", reply_markup=owner_panel()
+            )
             await _log_stage("Owner Start", "Owner opened start panel")
             return
 
         if await _is_sudo_user(user_id):
-            await message.reply_text("Start Report", reply_markup=sudo_panel(0))
+            await message.reply_text(
+                "👋 Ready to report?", reply_markup=sudo_panel(message.from_user.id)
+            )
             await _log_stage("Sudo Start", f"Sudo {user_id} opened start panel")
             return
 
-        await message.reply_text("You are not authorized.")
+        await message.reply_text(
+            "🚫 You are not authorized to use this bot.\n"
+            f"Contact the owner (ID: {config.OWNER_ID}) to request access."
+        )
         await _log_stage("Unauthorized", f"User {user_id} attempted /start")
 
     @app.on_message(filters.command("addsudo"))
@@ -136,9 +156,39 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
         await message.reply_text(f"Added {label} ({user_id}) to sudo users.")
         await _log_stage("Sudo Added", f"Owner added {user_id}")
 
+    async def _handle_sudo_list(message: Message) -> None:
+        if not await _owner_guard(message):
+            return
+        sudo_users = await persistence.get_sudo_users()
+        if not sudo_users:
+            await message.reply_text("No sudo users are configured.")
+            return
+        formatted = "\n".join([f"• `{uid}`" for uid in sorted(sudo_users)])
+        await message.reply_text(f"Current sudo users:\n{formatted}", parse_mode="markdown")
+
     @app.on_message(filters.command("rmsudo"))
     async def remove_sudo(_: Client, message: Message) -> None:
         await _wrap_errors(_handle_remove_sudo, message)
+
+    @app.on_message(filters.command("sudolist"))
+    async def sudo_list(_: Client, message: Message) -> None:
+        await _wrap_errors(_handle_sudo_list, message)
+
+    @app.on_message(filters.command("set_session") & filters.group)
+    async def set_session_group(_: Client, message: Message) -> None:
+        await _wrap_errors(_handle_set_session_group, message)
+
+    @app.on_message(filters.command("set_log") & filters.group)
+    async def set_logs_group(_: Client, message: Message) -> None:
+        await _wrap_errors(_handle_set_logs_group, message)
+
+    @app.on_message(filters.command("broadcast"))
+    async def broadcast(_: Client, message: Message) -> None:
+        await _wrap_errors(_handle_broadcast, message)
+
+    @app.on_message((filters.group) & (filters.text | filters.document))
+    async def session_ingest(_: Client, message: Message) -> None:
+        await _wrap_errors(_handle_session_ingest, message)
 
     async def _handle_remove_sudo(message: Message) -> None:
         if not await _owner_guard(message):
@@ -159,9 +209,123 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
         await message.reply_text(f"Removed {user_id} from sudo users.")
         await _log_stage("Sudo Removed", f"Owner removed {user_id}")
 
+    async def _handle_set_session_group(message: Message) -> None:
+        if not await _owner_guard(message):
+            return
+        if not await _ensure_admin(message.chat.id):
+            await message.reply_text("Please promote the bot to admin before setting this group.")
+            return
+        await persistence.save_session_group_id(message.chat.id)
+        await message.reply_text(
+            "✅ This group is now the session manager. Send session strings here to ingest them."
+        )
+        await _log_stage("Session Group Set", f"Owner set session group to {message.chat.id}")
+
+    async def _handle_set_logs_group(message: Message) -> None:
+        if not await _owner_guard(message):
+            return
+        if not await _ensure_admin(message.chat.id):
+            await message.reply_text("Please promote the bot to admin before setting this group.")
+            return
+        await persistence.save_logs_group_id(message.chat.id)
+        await message.reply_text("📝 Logs will now be sent to this group.")
+        await _log_stage("Logs Group Set", f"Owner set logs group to {message.chat.id}")
+
+    async def _handle_broadcast(message: Message) -> None:
+        logs_group = await persistence.get_logs_group_id()
+        if message.chat.id != logs_group:
+            await message.reply_text("Broadcasts can only be sent from the logs group.")
+            return
+        if not await _is_sudo_user(getattr(message.from_user, "id", None)):
+            await message.reply_text("You are not allowed to broadcast.")
+            return
+
+        parts = (message.text or "").split(maxsplit=1)
+        if len(parts) < 2:
+            await message.reply_text("Usage: /broadcast <message>")
+            return
+        payload = parts[1]
+        targets = await persistence.known_chats()
+        success = 0
+        failed = 0
+        for chat_id in targets:
+            try:
+                await app.send_message(chat_id, payload)
+                success += 1
+            except Exception:
+                failed += 1
+        await message.reply_text(f"Broadcast sent. Success: {success}, Failed: {failed}")
+        await _log_stage(
+            "Broadcast",
+            f"Broadcast from {message.from_user.id if message.from_user else 'unknown'} -> {success} ok / {failed} failed",
+        )
+
+    async def _handle_session_ingest(message: Message) -> None:
+        session_group = await persistence.get_session_group_id()
+        if not session_group or message.chat.id != session_group:
+            return
+        if not message.from_user or not is_owner(message.from_user.id):
+            return
+
+        text_parts = []
+        if message.text:
+            text_parts.append(message.text)
+        if message.caption:
+            text_parts.append(message.caption)
+
+        if message.document:
+            try:
+                data = await message.download(in_memory=True)
+                if isinstance(data, BytesIO):
+                    data.seek(0)
+                    text_parts.append(data.read().decode("utf-8", errors="ignore"))
+            except Exception:
+                await message.reply_text("Unable to read the document. Please send the session strings as text.")
+
+        raw_text = "\n".join(filter(None, text_parts))
+        sessions = list({s for s in extract_sessions_from_text(raw_text) if s})
+        if not sessions:
+            await message.reply_text("No session strings detected in this message.")
+            return
+
+        valid: list[str] = []
+        invalid: list[str] = []
+        for session in sessions:
+            if await validate_session_string(session):
+                valid.append(session)
+            else:
+                invalid.append(session)
+
+        added = await persistence.add_sessions(valid, added_by=message.from_user.id) if valid else []
+        total_saved = len(await persistence.get_sessions())
+        summary = [f"Validated sessions: {len(valid)}"]
+        if added:
+            summary.append(f"Saved new sessions: {len(added)}")
+        if invalid:
+            summary.append(f"Invalid sessions: {len(invalid)}")
+            await message.reply_text("Some session strings were invalid and were not saved.")
+
+        await message.reply_text("\n".join(summary))
+        await _log_stage(
+            "Session Ingest",
+            f"Owner saved {len(added)} sessions ({len(valid)} valid / {len(invalid)} invalid). Total stored: {total_saved}",
+        )
+
     @app.on_callback_query(filters.regex(r"^sudo:start$"))
     async def start_report(_: Client, query: CallbackQuery) -> None:
         await _wrap_errors(_handle_start_report, query)
+
+    @app.on_callback_query(filters.regex(r"^owner:manage$"))
+    async def manage_sessions(_: Client, query: CallbackQuery) -> None:
+        await _wrap_errors(_handle_owner_manage, query)
+
+    @app.on_callback_query(filters.regex(r"^owner:set_session_group$"))
+    async def owner_session_hint(_: Client, query: CallbackQuery) -> None:
+        await _wrap_errors(_handle_owner_session_hint, query)
+
+    @app.on_callback_query(filters.regex(r"^owner:set_logs_group$"))
+    async def owner_logs_hint(_: Client, query: CallbackQuery) -> None:
+        await _wrap_errors(_handle_owner_logs_hint, query)
 
     async def _handle_start_report(query: CallbackQuery) -> None:
         if not query.message or not query.from_user:
@@ -170,13 +334,20 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
             await query.answer("Unauthorized", show_alert=True)
             return
 
-        checking = await query.message.reply_text("Validating sessions, please wait...")
-        live_sessions = await prune_sessions(persistence, announce=True)
+        checking = await query.message.reply_text("🔎 Validating sessions, please wait...")
+        live_sessions = await _sessions_available()
         if not live_sessions:
-            await checking.edit_text("No sessions found. Please contact the bot owner.")
+            if is_owner(query.from_user.id):
+                await checking.edit_text(
+                    "No sessions found. Please send session strings in the configured session manager group first."
+                )
+            else:
+                await checking.edit_text("No sessions found. Please contact the bot owner.")
             return
 
-        await _log_stage("Start Report", f"User {query.from_user.id} checking in with {len(live_sessions)} sessions")
+        await _log_stage(
+            "Start Report", f"User {query.from_user.id} checking in with {len(live_sessions)} sessions"
+        )
 
         if queue.is_busy() and queue.active_user != query.from_user.id:
             position = queue.expected_position(query.from_user.id)
@@ -189,8 +360,33 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
         state = states.get(query.from_user.id)
         state.reset()
         state.stage = "type"
-        await checking.edit_text(f"Live sessions: {len(live_sessions)}")
-        await query.message.reply_text("Select Report Type", reply_markup=report_type_keyboard())
+        await checking.edit_text(f"✅ Live sessions loaded: {len(live_sessions)}")
+        await query.message.reply_text("Choose report visibility", reply_markup=report_type_keyboard())
+        await query.answer()
+
+    async def _handle_owner_manage(query: CallbackQuery) -> None:
+        if not query.from_user or not is_owner(query.from_user.id):
+            await query.answer("Owner only", show_alert=True)
+            return
+        sessions = await persistence.get_sessions()
+        await query.message.reply_text(f"Currently stored sessions: {len(sessions)}")
+        await _log_stage("Owner Manage", f"Owner checked sessions ({len(sessions)})")
+        await query.answer()
+
+    async def _handle_owner_session_hint(query: CallbackQuery) -> None:
+        if not query.from_user or not is_owner(query.from_user.id):
+            await query.answer("Owner only", show_alert=True)
+            return
+        await query.message.reply_text(
+            "Send /set_session in the target group where you'll drop session strings."
+        )
+        await query.answer()
+
+    async def _handle_owner_logs_hint(query: CallbackQuery) -> None:
+        if not query.from_user or not is_owner(query.from_user.id):
+            await query.answer("Owner only", show_alert=True)
+            return
+        await query.message.reply_text("Send /set_log in the logs group to start receiving updates.")
         await query.answer()
 
     @app.on_callback_query(filters.regex(r"^report:type:(public|private)$"))
@@ -208,14 +404,26 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
             await query.answer()
             return
         state.report_type = query.data.split(":")[-1]
-        state.stage = "awaiting_link"
-        await query.message.reply_text("Send the target message link (https://t.me/...) to report.")
+        if state.report_type == "private":
+            state.stage = "awaiting_private_join"
+            await query.message.reply_text(
+                "Send the private group/channel invite link or username so I can join with all sessions."
+            )
+        else:
+            state.stage = "awaiting_link"
+            await query.message.reply_text(
+                "Send the target message link (https://t.me/...) to report."
+            )
         await _log_stage("Report Type", f"User {query.from_user.id} chose {state.report_type}")
         await query.answer()
 
     @app.on_callback_query(filters.regex(r"^report:reason:[a-z_]+$"))
     async def choose_reason(_: Client, query: CallbackQuery) -> None:
         await _wrap_errors(_handle_reason, query)
+
+    @app.on_callback_query(filters.regex(r"^report:count:(\d+)$"))
+    async def choose_count(_: Client, query: CallbackQuery) -> None:
+        await _wrap_errors(_handle_count, query)
 
     async def _handle_reason(query: CallbackQuery) -> None:
         if not query.from_user:
@@ -226,14 +434,48 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
         key = query.data.split(":")[-1]
         label, code = REPORT_REASONS.get(key, ("Other", 9))
         state = states.get(query.from_user.id)
+        if key == "other":
+            state.stage = "awaiting_reason_text"
+            state.reason_code = 9
+            state.reason_text = None
+            await query.message.reply_text("Please type the custom reason to submit with your report.")
+            await query.answer()
+            return
+
         state.reason_code = code
         state.reason_text = label
         await query.answer(f"Reason set to {label}")
         await _log_stage("Report Reason", f"User {query.from_user.id} selected {label}")
         state.stage = "awaiting_count"
-        await query.message.reply_text("How many reports do you want to send?")
+        await query.message.reply_text(
+            "How many reports do you want to send?",
+            reply_markup=report_count_keyboard(),
+        )
 
-    @app.on_message(filters.private & filters.text & ~filters.command(["start", "broadcast", "set_session", "set_log"]))
+    async def _handle_count(query: CallbackQuery) -> None:
+        if not query.from_user or not await _is_sudo_user(query.from_user.id):
+            await query.answer("Unauthorized", show_alert=True)
+            return
+        state = states.get(query.from_user.id)
+        if state.stage != "awaiting_count":
+            await query.answer()
+            return
+        try:
+            count = int(query.data.rsplit(":", 1)[-1])
+        except ValueError:
+            await query.answer("Invalid selection", show_alert=True)
+            return
+
+        state.report_count = count
+        await query.message.reply_text(f"✅ Will send {count} reports.")
+        await _begin_report(query.message, state)
+        await query.answer()
+
+    @app.on_message(
+        filters.private
+        & filters.text
+        & ~filters.command(["start", "broadcast", "set_session", "set_log"])
+    )
     async def text_router(_: Client, message: Message) -> None:
         await _wrap_errors(_handle_text, message)
 
@@ -246,6 +488,19 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
             return
 
         state = states.get(message.from_user.id)
+
+        if state.stage == "awaiting_private_join":
+            invite = (message.text or "").strip()
+            if not _is_valid_target(invite):
+                await message.reply_text("Send a valid invite link or @username to continue.")
+                return
+            joined = await _join_sessions_to_chat(invite, message)
+            if not joined:
+                return
+            state.stage = "awaiting_link"
+            await message.reply_text("✅ Joined! Now send the message link to report.")
+            return
+
         if state.stage == "awaiting_link":
             if not _is_valid_link(message.text or ""):
                 await message.reply_text("Send a valid https://t.me/ link.")
@@ -268,11 +523,17 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
                 await message.reply_text("Please enter a valid number of reports (e.g., 10).")
             return
 
-        if state.stage == "awaiting_reason":
+        if state.stage == "awaiting_reason_text":
             state.reason_text = (message.text or "").strip()
-            state.reason_code = 9
+            if not state.reason_text:
+                await message.reply_text("Please type a custom reason.")
+                return
+            state.stage = "awaiting_count"
             await _log_stage("Custom Reason", f"User {message.from_user.id} provided custom reason")
-            await _begin_report(message, state)
+            await message.reply_text(
+                "How many reports do you want to send?",
+                reply_markup=report_count_keyboard(),
+            )
             return
 
         await message.reply_text("Use Start Report to begin a new report.")
@@ -285,6 +546,15 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
             return
         if not state.report_type:
             await message.reply_text("Choose Public or Private before proceeding.")
+            return
+        if state.reason_text is None:
+            await message.reply_text("Please choose a reason first.")
+            return
+
+        try:
+            _parse_link(state.target_link, state.report_type == "private")
+        except ValueError:
+            await message.reply_text("The link looks invalid. Please send a correct t.me message link.")
             return
 
         state.stage = "queued"
@@ -365,6 +635,12 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
         success_any = False
 
         count = state.report_count or 10
+        if count > len(sessions):
+            count = len(sessions)
+            await message.reply_text(
+                f"Only {count} sessions available; adjusting report count accordingly."
+            )
+
         for idx, session in enumerate(sessions[:count]):
             client = Client(
                 name=f"report_{idx}",
@@ -377,6 +653,7 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
                 await client.start()
                 await send_report(client, chat_ref, msg_id, reason_code, reason_text)
                 success_any = True
+                await asyncio.sleep(1.5)
             except RPCError:
                 continue
             except Exception:
@@ -386,11 +663,62 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
                     await client.stop()
         return success_any
 
+    async def _join_sessions_to_chat(target: str, message: Message) -> bool:
+        sessions = await _sessions_available()
+        if not sessions:
+            await message.reply_text("No sessions available. Contact the owner to add them first.")
+            return False
+
+        joined = 0
+        failed = 0
+        for idx, session in enumerate(sessions):
+            client = Client(
+                name=f"joiner_{idx}",
+                api_id=config.API_ID,
+                api_hash=config.API_HASH,
+                session_string=session,
+                workdir=f"/tmp/joiner_{idx}",
+            )
+            try:
+                await client.start()
+                await client.join_chat(target)
+                joined += 1
+                await asyncio.sleep(1)
+            except RPCError:
+                failed += 1
+            except Exception:
+                failed += 1
+            finally:
+                with contextlib.suppress(Exception):
+                    await client.stop()
+
+        if joined:
+            await message.reply_text(
+                f"🤝 Joined the group/channel with {joined}/{len(sessions)} sessions."
+            )
+            await _log_stage(
+                "Private Join",
+                f"User {message.from_user.id} joined {target} with {joined} sessions ({failed} failed)",
+            )
+            return True
+
+        await message.reply_text("Could not join the target with any session. Please verify the link.")
+        await _log_stage(
+            "Private Join Failed", f"User {message.from_user.id} failed to join {target}"
+        )
+        return False
+
+def _is_valid_target(text: str) -> bool:
+    value = (text or "").strip()
+    return value.startswith("https://t.me/") or value.startswith("t.me/") or value.startswith("@")
+
+
 def _is_valid_link(link: str) -> bool:
-    return link.startswith("https://t.me/")
+    cleaned = (link or "").strip()
+    return cleaned.startswith("https://t.me/") or cleaned.startswith("t.me/")
 
 def _parse_link(link: str, is_private: bool) -> Tuple[str | int, int]:
-    cleaned = link.replace("https://t.me/", "").strip("/")
+    cleaned = link.replace("https://t.me/", "").replace("http://t.me/", "").replace("t.me/", "").strip("/")
     parts = [part for part in cleaned.split("/") if part]
     if len(parts) < 2:
         raise ValueError("Invalid link")

@@ -15,7 +15,7 @@ from pyrogram.types import CallbackQuery, Message
 import config
 from logging_utils import log_error, log_report_summary, log_user_start, send_log
 from report import send_report
-from session_bot import extract_sessions_from_text, is_session_string, prune_sessions, validate_sessions
+from session_bot import extract_sessions_from_text, prune_sessions, validate_sessions
 from state import QueueEntry, ReportQueue, StateManager
 from sudo import is_owner, is_sudo
 from ui import REPORT_REASONS, owner_panel, queued_message, reason_keyboard, report_type_keyboard, sudo_panel
@@ -411,7 +411,7 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
         )
         await send_log(app, logs_group, summary)
 
-    @app.on_message(filters.group & filters.text)
+    @app.on_message(filters.group & (filters.text | filters.caption))
     async def session_ingestion(_: Client, message: Message) -> None:
         await _wrap_errors(_handle_session_ingestion, message)
 
@@ -421,26 +421,34 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
             return
         if not message.from_user:
             return
-        if not is_owner(message.from_user.id):
-            return
 
-        sessions = extract_sessions_from_text(message.text or "")
-        if not sessions or not all(is_session_string(s) for s in sessions):
+        text_content = message.text or message.caption or ""
+        sessions = extract_sessions_from_text(text_content)
+        if not sessions:
             await message.reply_text("❌ Invalid session string")
             return
+
         valid, invalid = await validate_sessions(sessions)
         logs_group = await persistence.logs_group()
+
+        response_parts: list[str] = []
         if valid:
-            await persistence.add_sessions(valid, added_by=message.from_user.id)
-            await message.reply_text("✅ Session saved successfully")
+            added = await persistence.add_sessions(valid, added_by=message.from_user.id)
+            total_sessions = len(await persistence.get_sessions())
+            response_parts.append(
+                f"✅ Valid sessions: {len(valid)} (added {len(added)})\n📦 Total stored: {total_sessions}"
+            )
             await send_log(
                 app,
                 logs_group,
                 f"{len(valid)} session(s) added from the session manager group.",
             )
         if invalid:
-            await message.reply_text("❌ Session is invalid or expired")
+            response_parts.append(f"❌ Invalid session(s): {len(invalid)}")
             await send_log(app, logs_group, f"Ignored {len(invalid)} invalid session strings.")
+
+        if response_parts:
+            await message.reply_text("\n".join(response_parts))
 
     @app.on_callback_query(filters.regex(r"^owner:(manage|set_session_group|set_logs_group)$"))
     async def owner_actions(_: Client, query: CallbackQuery) -> None:

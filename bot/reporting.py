@@ -106,7 +106,16 @@ class SessionPool:
                 logging.exception("Failed to stop client %s", getattr(client, "name", "unknown"))
 
 
-async def run_report_job(query, context: ContextTypes.DEFAULT_TYPE, job_data: dict) -> None:
+async def run_report_job(
+    query,
+    context: ContextTypes.DEFAULT_TYPE,
+    job_data: dict,
+    *,
+    status_message=None,
+    send_progress_updates: bool = True,
+    suppress_final_message: bool = False,
+    status_hook=None,
+) -> dict:
     user = query.from_user
     chat_id = query.message.chat_id
 
@@ -120,7 +129,8 @@ async def run_report_job(query, context: ContextTypes.DEFAULT_TYPE, job_data: di
     reason_cycle = job_data.get("reason_cycle", False)
     request_timeout = int(job_data.get("request_timeout", 25))
 
-    status_message = await context.bot.send_message(chat_id=chat_id, text="Preparing clients…")
+    if send_progress_updates:
+        status_message = status_message or await context.bot.send_message(chat_id=chat_id, text="Preparing clients…")
 
     if sessions:
         try:
@@ -200,14 +210,21 @@ async def run_report_job(query, context: ContextTypes.DEFAULT_TYPE, job_data: di
 
                 text = "\n".join(sections)
 
-                try:
-                    await status_message.edit_text(
-                        text,
-                        parse_mode=ParseMode.HTML,
-                        disable_web_page_preview=True,
-                    )
-                except Exception:
-                    logging.exception("Failed to update status message")
+                if status_hook:
+                    try:
+                        await status_hook(payload)
+                    except Exception:
+                        logging.exception("Status hook failed")
+
+                if send_progress_updates and status_message:
+                    try:
+                        await status_message.edit_text(
+                            text,
+                            parse_mode=ParseMode.HTML,
+                            disable_web_page_preview=True,
+                        )
+                    except Exception:
+                        logging.exception("Failed to update status message")
 
             try:
                 summary = await perform_reporting(
@@ -278,14 +295,23 @@ async def run_report_job(query, context: ContextTypes.DEFAULT_TYPE, job_data: di
     except asyncio.CancelledError:  # pragma: no cover - application shutdown
         logging.info("Report job cancelled during shutdown")
         card = render_card("Report cancelled", ["The reporting task was cancelled."], [])
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=f"<pre>{card}</pre>",
-            parse_mode=ParseMode.HTML,
-            reply_markup=report_again_keyboard(),
-        )
+        if not suppress_final_message:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"<pre>{card}</pre>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=report_again_keyboard(),
+            )
         reset_user_context(context, user.id if user else None)
-        return
+        return {
+            "total_success": total_success,
+            "total_failed": total_failed,
+            "sessions_started": total_sessions_started,
+            "sessions_failed": total_sessions_failed,
+            "halted": True,
+            "last_error": "cancelled",
+            "duration": format_duration(datetime.now(timezone.utc) - overall_started),
+        }
 
     body_lines: list[str] = []
     for msg in messages:
@@ -309,14 +335,24 @@ async def run_report_job(query, context: ContextTypes.DEFAULT_TYPE, job_data: di
     title = "Report halted" if halted else "Report completed"
     card = render_card(title.title(), body_lines, footer)
 
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=f"<pre>{card}</pre>",
-        parse_mode=ParseMode.HTML,
-        reply_markup=report_again_keyboard(),
-    )
+    if not suppress_final_message:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"<pre>{card}</pre>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=report_again_keyboard(),
+        )
 
     reset_user_context(context, user.id if user else None)
+    return {
+        "total_success": total_success,
+        "total_failed": total_failed,
+        "sessions_started": total_sessions_started,
+        "sessions_failed": total_sessions_failed,
+        "halted": halted,
+        "last_error": last_error,
+        "duration": total_duration,
+    }
 
 
 async def perform_reporting(
@@ -496,34 +532,47 @@ async def perform_reporting(
                 }
 
         resolved_chat_id: int | None = None
-        primary = clients[0]
 
         await _push_status(
             {"target": {"validated": False, "summary": "validating target"}, "report": {"clients": join_progress}}
         )
 
-        try:
-            resolved = await asyncio.wait_for(resolve_entity(primary, target_spec), timeout=request_timeout)
-        except asyncio.TimeoutError:
-            await _push_status(
-                {"target": {"validated": False, "summary": "target validation failed", "error": "timeout"}}
-            )
-            return {"success": 0, "failed": 0, "halted": True, "error": "TARGET_TIMEOUT"}
+        resolution_errors: list[str | None] = []
+        resolved = None
+        resolver_client = None
+        for client in clients:
+            try:
+                resolved = await asyncio.wait_for(resolve_entity(client, target_spec), timeout=request_timeout)
+            except asyncio.TimeoutError:
+                resolution_errors.append("TARGET_TIMEOUT")
+                continue
 
-        if not resolved.ok or not resolved.chat_id:
+            if resolved.ok and resolved.chat_id:
+                resolved_chat_id = int(resolved.chat_id)
+                resolver_client = client
+                break
+
+            resolution_errors.append(resolved.error)
+            if resolved and resolved.error in {"PeerIdInvalid", "ChannelPrivate"}:
+                continue
+            break
+
+        if not resolved or not (resolved.ok and resolved_chat_id):
             return {
                 "success": 0,
                 "failed": 0,
                 "halted": True,
-                "error": resolved.error or "UNRESOLVED_TARGET",
+                "error": resolved.error if resolved else ",".join(filter(None, resolution_errors)) or "UNRESOLVED_TARGET",
             }
 
-        resolved_chat_id = int(resolved.chat_id)
-
         if target_spec.message_id:
+            client_for_message = resolver_client or (clients[0] if clients else None)
             try:
+                if client_for_message is None:
+                    raise RuntimeError("No client available to fetch target message")
+
                 message = await asyncio.wait_for(
-                    primary.get_messages(resolved_chat_id, target_spec.message_id), timeout=request_timeout
+                    client_for_message.get_messages(resolved_chat_id, target_spec.message_id), timeout=request_timeout
                 )
                 if message is None:
                     return {"success": 0, "failed": 0, "halted": True, "error": "MESSAGE_NOT_FOUND"}

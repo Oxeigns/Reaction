@@ -192,6 +192,8 @@ def _get_cached(normalized: str) -> dict[str, Any] | None:
 
 
 def _cache_result(normalized: str, result: dict[str, Any], *, failure: bool = False) -> None:
+    if failure and result.get("error") in {"PeerIdInvalid", "ChannelPrivate"}:
+        return
     ttl = _FAILURE_TTL if failure else _SUCCESS_TTL
     store = _FAILURE_CACHE if failure else _CACHE
     store[normalized.lower()] = (result, datetime.now(timezone.utc) + ttl)
@@ -561,7 +563,7 @@ async def resolve_report_target(
             "message_ids": spec.message_ids,
             "resolved_by": None,
             "did_join": False,
-            "note": "internal_without_invite",
+            "note": "invite_required_for_private_link",
             "error": "Cannot auto-join from t.me/c link without invite or membership",
         }
 
@@ -632,9 +634,7 @@ async def resolve_report_target(
         }
         if error == "FloodWait":
             await _sleep_for_flood(1)
-        if fallback_result and fallback_result.get("error") not in {"PeerIdInvalid", "ChannelPrivate"}:
-            _cache_result(spec.cache_key(), fallback_result, failure=True)
-        return fallback_result
+        continue
 
     summary = ", ".join(f"{sess}:{err}" for sess, err in resolution_errors.items() if err)
     result = fallback_result or {

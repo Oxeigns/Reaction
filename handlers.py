@@ -45,6 +45,11 @@ def register_handlers(app: Client, persistence, states: StateManager, queue: Rep
             logging.exception("Handler error")
             await log_error(app, await persistence.get_logs_group_id(), exc, config.OWNER_ID)
 
+    async def _queue_error(exc: Exception) -> None:
+        await log_error(app, await persistence.get_logs_group_id(), exc, config.OWNER_ID)
+
+    queue.set_error_handler(_queue_error)
+
     async def _owner_guard(message: Message) -> bool:
         if not message.from_user or not is_owner(message.from_user.id):
             await message.reply_text("Only the owner can manage sudo users.")

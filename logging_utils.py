@@ -3,71 +3,82 @@ from __future__ import annotations
 """Utilities for sending logs and errors to the configured logs group."""
 
 import traceback
-
 from pyrogram import Client
 from pyrogram.errors import RPCError
+from pyrogram.types import Message, User
 
 
-async def send_log(client: Client, chat_id: int | None, text: str, *, parse_mode: str | None = None) -> None:
-    """Send a log message safely."""
-
+async def send_log(client: Client, chat_id: int | None, text: str, *, parse_mode: str = "markdown") -> None:
+    """Send a log message safely without crashing the main flow."""
     if not chat_id:
         return
     try:
         await client.send_message(chat_id, text, parse_mode=parse_mode)
     except Exception:
-        # Avoid crashing the bot on log errors
         pass
 
 
-async def log_user_start(client: Client, logs_group: int | None, message) -> None:
+async def log_user_start(client: Client, logs_group: int | None, message: Message) -> None:
     """Log whenever any user starts the bot."""
-
     if not logs_group or not message.from_user:
         return
+    
+    user = message.from_user
+    username = f" (@{user.username})" if user.username else ""
+    
     text = (
-        "📥 New user started the bot\n"
-        f"👤 {message.from_user.first_name}\n"
-        f"🆔 ID: {message.from_user.id}"
+        "📥 **New User Interaction**\n"
+        f"👤 **Name:** {user.first_name}\n"
+        f"🆔 **ID:** `{user.id}`{username}"
     )
-    await send_log(client, logs_group, text, parse_mode="markdown")
+    await send_log(client, logs_group, text)
 
 
 async def log_report_summary(
     client: Client,
     logs_group: int | None,
-    *,
-    user,
+    user: User,  # Removed the '*' to allow positional args from handlers.py
     target: str,
     elapsed: float,
     success: bool,
 ) -> None:
     """Send a summary entry after a report completes."""
+    if not logs_group:
+        return
 
-    username = getattr(user, "username", None)
-    user_label = f"@{username}" if username else getattr(user, "first_name", None) or "User"
-    duration = round(elapsed, 2)
-    status_label = "Success" if success else "Fail"
+    username = f" (@{user.username})" if user.username else ""
+    duration = round(elapsed, 1)
+    status_label = "Success" if success else "Failed"
     status_prefix = "✅" if success else "❌"
+    
     text = (
-        "✅ Report Completed\n"
-        f"👤 User: {user_label} ({getattr(user, 'id', 'n/a')})\n"
-        f"🔗 Target: {target}\n"
-        f"⏱ Time taken: {duration}s\n"
-        f"{status_prefix} Status: {status_label}"
+        f"{status_prefix} **Report Job Finished**\n"
+        f"👤 **Executor:** {user.first_name}{username}\n"
+        f"🔗 **Target:** `{target}`\n"
+        f"⏱ **Duration:** `{duration}s`\n"
+        f"📊 **Status:** {status_label}"
     )
-    await send_log(client, logs_group, text, parse_mode="markdown")
+    await send_log(client, logs_group, text)
 
 
 async def log_error(client: Client, logs_group: int | None, exc: Exception, owner_id: int | None = None) -> None:
-    """Send an error trace to the logs group, tagging the owner when known."""
-
+    """Send an error trace to the logs group, tagging the owner."""
     if not logs_group:
         return
-    mention = f"[Owner](tg://user?id={owner_id})" if owner_id else "Owner"
-    text = f"⚠️ Error Detected\n{mention}\n``{traceback.format_exc()}``"
+        
+    mention = f"[Owner](tg://user?id={owner_id})" if owner_id else "Administrator"
+    # Use HTML or Markdown code blocks to prevent long traces from formatting weirdly
+    trace = traceback.format_exc()
+    if len(trace) > 3000:  # Telegram message limit safety
+        trace = trace[-3000:] + "\n... (trace truncated)"
+        
+    text = (
+        "⚠️ **Internal Bot Error**\n"
+        f"👤 **Notify:** {mention}\n\n"
+        f"```python\n{trace}```"
+    )
+    
     try:
         await client.send_message(logs_group, text, parse_mode="markdown")
-    except RPCError:
+    except Exception:
         pass
-

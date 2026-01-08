@@ -132,14 +132,16 @@ class DataStore:
     # ------------------- Sudo users -------------------
     async def add_sudo_user(self, user_id: int) -> None:
         self._sudo_users.add(user_id)
-        config.SUDO_USERS.add(user_id)
+        if hasattr(config, "SUDO_USERS"):
+            config.SUDO_USERS.add(user_id)
         if self.db:
             await self.db.sudo.update_one({"user_id": user_id}, {"$set": {"user_id": user_id}}, upsert=True)
         self._persist_snapshot()
 
     async def get_sudo_users(self) -> set[int]:
         if self.db:
-            users = await self.db.sudo.find().to_list(None)
+            cursor = self.db.sudo.find()
+            users = await cursor.to_list(length=None)
             return {u["user_id"] for u in users if "user_id" in u}
         return set(self._sudo_users)
 
@@ -153,3 +155,46 @@ class DataStore:
     async def close(self) -> None:
         if self.client:
             self.client.close()
+
+# --- Factory and Fallback Logic (Crucial for Dependencies) ---
+
+class FallbackDataStore(DataStore):
+    """Persists to local JSON file if MongoDB is not available."""
+    def __init__(self, path: str = "data_snapshot.json") -> None:
+        super().__init__()
+        self._snapshot_path = Path(path)
+        if self._snapshot_path.exists():
+            try:
+                with open(self._snapshot_path, "r") as f:
+                    self._update_from_snapshot(json.load(f))
+            except Exception as e:
+                logging.error(f"Failed to load snapshot: {e}")
+
+    def _persist_snapshot(self) -> None:
+        payload = {
+            "sessions": list(self._in_memory_sessions),
+            "reports": self._in_memory_reports,
+            "config": self._in_memory_config,
+            "chats": list(self._in_memory_chats),
+            "sudo": list(self._sudo_users),
+        }
+        try:
+            with open(self._snapshot_path, "w") as f:
+                json.dump(payload, f)
+        except Exception as e:
+            logging.error(f"Failed to save snapshot: {e}")
+
+def build_datastore(mongo_uri: str | None) -> DataStore | FallbackDataStore:
+    """The factory function expected by dependencies.py"""
+    if mongo_uri:
+        try:
+            from motor.motor_asyncio import AsyncIOMotorClient
+            client = AsyncIOMotorClient(mongo_uri)
+            db = client.get_database("reporter")
+            logging.info("MongoDB DataStore initialized successfully.")
+            return DataStore(client=client, db=db, mongo_uri=mongo_uri)
+        except Exception as e:
+            logging.error(f"MongoDB connection failed: {e}. Using Fallback.")
+    
+    logging.warning("No MONGO_URI provided. Using Local JSON Fallback.")
+    return FallbackDataStore()

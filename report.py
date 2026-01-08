@@ -11,7 +11,7 @@ import asyncio
 from typing import Iterable, Sequence
 
 from pyrogram import Client
-from pyrogram.errors import BadRequest, FloodWait, MessageIdInvalid, RPCError
+from pyrogram.errors import BadRequest, FloodWait, MessageIdInvalid, RPCError, PeerIdInvalid
 from pyrogram.raw.types import (
     InputReportReasonChildAbuse,
     InputReportReasonCopyright,
@@ -111,10 +111,27 @@ async def _resolve_peer_for_report(client: Client, chat_id):
 
 
 async def send_report(client: Client, chat_id, message_id: int, reason: int | object, reason_text: str) -> bool:
-    """Send a report against a specific message."""
+    """Send a report against a specific message.
+
+    This helper resolves the target first so resolution errors (peer id invalid,
+    unable to resolve username) are surfaced consistently as BadRequest/PeerIdInvalid
+    and can be handled by callers.
+    """
     try:
         reason_obj = _build_reason(reason, reason_text)
-        await client.send_report(chat_id=chat_id, message_id=message_id, reason=reason_obj, message=reason_text)
+
+        # Pre-resolve the peer so errors like "Peer id invalid" or "Unable to resolve"
+        # are raised here and can be handled in a consistent way.
+        try:
+            resolved_peer = await _resolve_peer_for_report(client, chat_id)
+        except (BadRequest, PeerIdInvalid):
+            # Bubble up resolution-related API errors so callers can decide how to react.
+            raise
+        except Exception as exc:
+            # Wrap unexpected resolution errors into a BadRequest for consistency.
+            raise BadRequest(f"Unable to resolve the target for reporting: {exc}") from exc
+
+        await client.send_report(chat_id=resolved_peer, message_id=message_id, reason=reason_obj, message=reason_text)
         return True
 
     except MessageIdInvalid:
@@ -123,121 +140,9 @@ async def send_report(client: Client, chat_id, message_id: int, reason: int | ob
         )
         return True
     except (FloodWait, BadRequest, RPCError):
+        # Let callers or higher-level flows handle these (flood waits, API errors).
         raise
     except Exception as exc:  # pragma: no cover - defensive logging
-        print(f"Report API Error (Session {getattr(client, 'name', 'unknown')}): {exc}")
+        # Defensive logging for unexpected errors — do not crash the entire run.
+        print(f"[{getattr(client, 'name', 'unknown')}] Unexpected error while reporting: {exc}")
         return False
-
-
-async def report_profile_photo(client: Client, entity_id, reason: int | object, reason_text: str) -> bool:
-    """Report a user profile, chat, or generic entity."""
-
-    try:
-        reason_obj = _build_reason(reason, reason_text)
-        await client.send_report(chat_id=entity_id, message_id=None, reason=reason_obj, message=reason_text)
-        return True
-
-    except (FloodWait, BadRequest, RPCError):
-        raise
-    except Exception as exc:  # pragma: no cover - defensive logging
-        print(f"Profile/Chat Report API Error (Session {getattr(client, 'name', 'unknown')}): {exc}")
-        return False
-
-
-async def bulk_report_messages(
-    clients: Sequence[Client],
-    chat_id,
-    message_ids: Iterable[int],
-    reason: int,
-    reason_text: str,
-    *,
-    concurrency: int = 5,
-    retry_on_flood: bool = True,
-) -> dict[str, int]:
-    """Report multiple messages using multiple client sessions."""
-
-    semaphore = asyncio.Semaphore(max(concurrency, 1))
-
-    async def _report_single(client: Client, message_id: int) -> str:
-        async with semaphore:
-            try:
-                ok = await send_report(client, chat_id, message_id, reason, reason_text)
-                return "success" if ok else "failed"
-            except FloodWait as fw:
-                if not retry_on_flood:
-                    print(
-                        f"[{getattr(client, 'name', 'unknown')}] Flood wait {fw.value}s for message {message_id}. Skipping."
-                    )
-                    return "failed"
-
-                sleep_for = getattr(fw, "value", 1)
-                print(
-                    f"[{getattr(client, 'name', 'unknown')}] Flood wait {sleep_for}s for message {message_id}. Retrying once."
-                )
-                await asyncio.sleep(sleep_for)
-
-                try:
-                    ok = await send_report(client, chat_id, message_id, reason, reason_text)
-                    return "success" if ok else "failed"
-                except Exception as exc:  # pragma: no cover - defensive logging
-                    print(
-                        f"[{getattr(client, 'name', 'unknown')}] Retry failed for message {message_id}: {exc}"
-                    )
-                    return "failed"
-
-            except BadRequest as exc:
-                print(
-                    f"[{getattr(client, 'name', 'unknown')}] Bad request while reporting {message_id}: {exc}"
-                )
-                return "failed"
-            except RPCError as exc:
-                print(f"[{getattr(client, 'name', 'unknown')}] RPC error for {message_id}: {exc}")
-                return "failed"
-
-    tasks = [
-        asyncio.create_task(_report_single(client, int(message_id)))
-        for client in clients
-        for message_id in message_ids
-    ]
-
-    summary = {"success": 0, "failed": 0}
-    if not tasks:
-        return summary
-
-    for result in await asyncio.gather(*tasks):
-        summary[result] += 1
-
-    return summary
-
-
-if not hasattr(Client, "send_report"):
-    # Lazy imports so users without reporting needs avoid pulling raw types prematurely.
-    from pyrogram.raw.functions.messages import Report
-
-    async def _client_send_report(
-        self,
-        chat_id,
-        message_id: int | None = None,
-        reason: int | object = 0,
-        message: str = "",
-    ) -> None:
-        """High-level wrapper for the raw ``messages.Report`` call."""
-
-        try:
-            peer = await _resolve_peer_for_report(self, chat_id)
-
-            if not hasattr(peer, "write"):
-                raise BadRequest("Unable to resolve the target for reporting.")
-
-            reason_obj = _build_reason(reason, message)
-
-            ids = [int(message_id)] if message_id is not None else []
-
-            await self.invoke(Report(peer=peer, id=ids, reason=reason_obj, message=message or ""))
-
-        except MessageIdInvalid:
-            raise
-        except (FloodWait, BadRequest, RPCError):
-            raise
-
-    setattr(Client, "send_report", _client_send_report)
